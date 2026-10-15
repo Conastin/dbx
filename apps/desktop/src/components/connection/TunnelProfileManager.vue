@@ -14,6 +14,7 @@ import { useTunnelProfileStore } from "@/stores/tunnelProfileStore";
 import { createTunnelProfile, createTunnelProfileTestGuard, tunnelProfileSummary, type TunnelProfileType } from "@/lib/connection/tunnelProfiles";
 import { applySshConfigHostAliasPrefill as prefillSshConfigHostAlias } from "@/lib/connection/sshConfigHosts";
 import { applySshAuthMethod } from "@/lib/connection/sshAuthMethod";
+import { stripInvisibleCharactersFromLayer } from "@/lib/connection/credentialSanitizer";
 import * as api from "@/lib/backend/api";
 import type { SshConfigHostEntry, TunnelProfile } from "@/types/database";
 import { translateBackendError } from "@/i18n/backend-errors";
@@ -151,7 +152,10 @@ async function save() {
   invalidateProfileTest();
   isSaving.value = true;
   try {
-    await store.saveProfiles(cloneProfiles(draft.value));
+    // Pasted credentials may carry invisible characters that trim() keeps (#9043).
+    const sanitized = cloneProfiles(draft.value);
+    sanitized.forEach(stripInvisibleCharactersFromLayer);
+    await store.saveProfiles(sanitized);
     toast(t("settings.tunnelsSaved"));
   } catch (error) {
     toast(t("settings.tunnelsSaveFailed", { message: translateBackendError(t, error) }), 5000);
@@ -333,15 +337,15 @@ async function testSelected() {
       <template v-else-if="selectedHttp">
         <div class="grid grid-cols-4 items-center gap-4">
           <Label class="text-xs">{{ t("connection.httpTunnelUrl") }}</Label>
-          <Input v-model="selectedHttp.url" class="col-span-3" placeholder="https://dbx.example.com/dbx_tunnel.php" />
+          <Input v-model="selectedHttp!.url" class="col-span-3" placeholder="https://dbx.example.com/dbx_tunnel.php" />
         </div>
         <div class="grid grid-cols-4 items-center gap-4">
           <Label class="text-xs">{{ t("connection.httpTunnelToken") }}</Label>
-          <PasswordInput v-model="selectedHttp.token" class="col-span-3" :placeholder="t('connection.httpTunnelTokenPlaceholder')" />
+          <PasswordInput v-model="selectedHttp!.token" class="col-span-3" :placeholder="t('connection.httpTunnelTokenPlaceholder')" />
         </div>
         <div class="grid grid-cols-4 items-center gap-4">
           <Label class="text-xs">{{ t("connection.httpTunnelConnectTimeout") }}</Label>
-          <Input v-model.number="selectedHttp.connect_timeout_secs" type="number" min="1" max="300" step="1" class="col-span-3" />
+          <Input v-model.number="selectedHttp!.connect_timeout_secs" type="number" min="1" max="300" step="1" class="col-span-3" />
         </div>
       </template>
     </template>

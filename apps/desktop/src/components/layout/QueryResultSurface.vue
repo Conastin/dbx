@@ -18,6 +18,7 @@ const surfaceProps = computed<ContentAreaSurfaceProps>(() => ({
   activeOutputView: props.activeOutputView,
   formatSqlRequest: props.formatSqlRequest,
   compressSqlRequest: props.compressSqlRequest,
+  keywordCaseRequest: props.keywordCaseRequest,
   selectedSql: props.selectedSql,
   cursorPos: props.cursorPos,
   blockDangerousRedisCommands: props.blockDangerousRedisCommands,
@@ -27,12 +28,13 @@ const bindings = computed(() => ({ ...surfaceProps.value, ...contentEmits }));
 const contentAreaRef = ref<InstanceType<typeof ContentArea> | null>(null);
 
 defineExpose<QueryResultSurfaceHandle>({
-  focusSearch: () => contentAreaRef.value?.focusSearch() ?? false,
+  focusSearch: (target: Element | null = null) => contentAreaRef.value?.focusSearch(target) ?? false,
   refreshData: () => contentAreaRef.value?.refreshData() ?? false,
   toggleResultsPane: () => contentAreaRef.value?.toggleResultsPane() ?? false,
   handleModRTarget: (target: Element) => contentAreaRef.value?.handleModRTarget(target) ?? false,
   previewStatementRange: (range: StatementRange | null) => contentAreaRef.value?.previewStatementRange(range) ?? false,
   focusStatementRange: (range: StatementRange | null) => contentAreaRef.value?.focusStatementRange(range) ?? false,
+  focusErrorPosition: (offset: number) => contentAreaRef.value?.focusErrorPosition(offset) ?? false,
 });
 </script>
 

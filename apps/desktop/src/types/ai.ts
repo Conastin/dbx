@@ -1,4 +1,24 @@
-export type AiProvider = "claude" | "openai" | "gemini" | "deepseek" | "kimi" | "qwen" | "minimax" | "ollama" | "anthropic-compatible" | "openai-compatible" | "claude-code-cli" | "pi-agent-cli" | "codex-cli" | "opencode-cli" | "cursor-cli" | "grok-cli" | "codebuddy-cli" | "qoder-cli" | "custom";
+export type AiProvider =
+  | "claude"
+  | "openai"
+  | "gemini"
+  | "deepseek"
+  | "kimi"
+  | "qwen"
+  | "zhipu"
+  | "minimax"
+  | "ollama"
+  | "anthropic-compatible"
+  | "openai-compatible"
+  | "claude-code-cli"
+  | "pi-agent-cli"
+  | "codex-cli"
+  | "opencode-cli"
+  | "cursor-cli"
+  | "grok-cli"
+  | "codebuddy-cli"
+  | "qoder-cli"
+  | "custom";
 export type AiApiStyle = "completions" | "responses" | "anthropic-messages";
 export type AiAuthMethod = "api-key" | "bearer";
 export type AiEffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
@@ -80,6 +100,17 @@ export interface AiConfigItem extends AiConfig {
   isDefault?: boolean;
 }
 
+export interface CcSwitchImportSkipped {
+  appType: string;
+  name: string;
+  reason: string;
+}
+
+export interface CcSwitchImportResult {
+  configs: AiConfigItem[];
+  skipped: CcSwitchImportSkipped[];
+}
+
 export interface AiActiveModelSelection {
   configId: string;
   modelId: string;
@@ -96,6 +127,8 @@ export interface AiChatSelectionState {
   active?: AiActiveModelSelection;
   effortPreferences: AiModelEffortPreference[];
   defaultMode?: AiAssistantMode;
+  /** Whether new AI conversations start with the action picker on `auto` (#9118). */
+  defaultAutoRouting?: boolean;
   /** Whether opening the AI panel restores the most recently updated conversation. */
   restoreLastConversation?: boolean;
   /** Prompt template ids auto-applied when the AI panel opens, keyed by connection db_type. */

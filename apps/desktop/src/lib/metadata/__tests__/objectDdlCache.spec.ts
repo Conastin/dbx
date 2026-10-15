@@ -11,14 +11,34 @@ const mocks = vi.hoisted(() => ({
 vi.mock("@/lib/backend/api", () => mocks);
 
 import { cancelObjectDdlLoadsForConnection, getObjectDdlCacheDebugStateForTests, invalidateObjectDdl, invalidateObjectDdlCache, loadObjectDdl, objectDdlCacheKey } from "@/lib/metadata/objectDdlCache";
+import { isObjectCacheInvalidationError } from "@/lib/metadata/objectCacheInvalidationError";
 import { clearMetadataRuntimeCache } from "@/lib/metadata/metadataRuntimeCache";
 
 const request = { connectionId: "c1", database: "app", schema: "public", tableName: "users", catalog: "analytics" } as const;
 
 describe("objectDdlCache", () => {
+  it.each(["remote", "disk"])("settles local waiting when cancellation retires a never-returning %s read", async (phase) => {
+    if (phase === "disk") mocks.loadSchemaCache.mockReturnValueOnce(new Promise(() => undefined));
+    mocks.getTableDisplayDdl.mockReturnValueOnce(new Promise(() => undefined));
+    let settled = false;
+    const result = loadObjectDdl(request).then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+    await vi.waitFor(() => expect(phase === "remote" ? mocks.getTableDisplayDdl.mock.calls.length : getObjectDdlCacheDebugStateForTests().activeReads).toBe(1));
+    cancelObjectDdlLoadsForConnection(request.connectionId);
+    await vi.waitFor(() => expect(settled).toBe(true));
+    await result;
+    expect(getObjectDdlCacheDebugStateForTests().activeReads).toBe(0);
+  });
   beforeEach(() => {
     clearMetadataRuntimeCache();
     vi.clearAllMocks();
+    mocks.getTableDisplayDdl.mockReset();
     mocks.persisted.clear();
     mocks.loadSchemaCache.mockImplementation(async (cacheKey: string) => mocks.persisted.get(cacheKey) ?? null);
     mocks.saveSchemaCache.mockImplementation(async (cacheKey: string, payload: unknown) => {
@@ -256,11 +276,163 @@ describe("objectDdlCache", () => {
     await vi.waitFor(() => expect(mocks.getTableDisplayDdl).toHaveBeenCalledTimes(1));
     cancelObjectDdlLoadsForConnection(request.connectionId);
     releaseOld("old session ddl");
-    await expect(oldLoad).resolves.toMatchObject({ ddl: "old session ddl" });
+    await expect(oldLoad).rejects.toThrow("Metadata waiting cancelled locally.");
 
     mocks.getTableDisplayDdl.mockResolvedValueOnce("new session ddl");
     await expect(loadObjectDdl(request)).resolves.toMatchObject({ ddl: "new session ddl", cacheStatus: "remote" });
     expect(mocks.getTableDisplayDdl).toHaveBeenCalledTimes(2);
     expect(mocks.deleteSchemaCachePrefix).not.toHaveBeenCalledWith("object-ddl:v1:c1:");
+  });
+
+  describe("strict connection-level invalidation", () => {
+    const connectionMatch = { connectionId: "c1" };
+
+    it.each(["object-ddl:v1:c1:", "object-meta:v1:c1:"])("waits for the other namespace when %s fails", async (failedPrefix) => {
+      let release!: () => void;
+      const pending = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      mocks.deleteSchemaCachePrefix.mockImplementation((prefix: string) => (prefix === failedPrefix ? Promise.reject(new Error("locked")) : pending));
+      let settled = false;
+      const outcome = invalidateObjectDdlCache(connectionMatch, { strict: true }).then(
+        () => {
+          settled = true;
+          return undefined;
+        },
+        (error: unknown) => {
+          settled = true;
+          return error;
+        },
+      );
+      await vi.waitFor(() => expect(mocks.deleteSchemaCachePrefix).toHaveBeenCalledTimes(2));
+      // Drain the rejection handlers, without releasing the other deletion.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(settled).toBe(false);
+      release();
+      const failure = await outcome;
+      expect(isObjectCacheInvalidationError(failure)).toBe(true);
+      expect(failure).toMatchObject({ scope: failedPrefix, message: "locked" });
+    });
+
+    function objectPrefixes(): string[] {
+      return mocks.deleteSchemaCachePrefix.mock.calls.map(([prefix]) => prefix as string);
+    }
+
+    function rejectAllDeletions(error: Error) {
+      let rejectGate: (reason: Error) => void = () => {};
+      const gate = new Promise<void>((_resolve, reject) => {
+        rejectGate = reject;
+      });
+      mocks.deleteSchemaCachePrefix.mockImplementation(() =>
+        gate.then(
+          () => undefined,
+          () => {
+            throw error;
+          },
+        ),
+      );
+      return () => rejectGate(error);
+    }
+
+    it("rejects with a marked object cache error when the persisted deletion fails", async () => {
+      mocks.deleteSchemaCachePrefix.mockRejectedValue(new Error("sqlite locked"));
+
+      const failure = await invalidateObjectDdlCache(connectionMatch, { strict: true }).then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      expect(failure).toBeInstanceOf(Error);
+      expect(isObjectCacheInvalidationError(failure)).toBe(true);
+      expect((failure as Error).message).toBe("sqlite locked");
+      // Both the DDL and the object-metadata namespace deletions were attempted.
+      expect(objectPrefixes()).toContain("object-ddl:v1:c1:");
+      expect(objectPrefixes()).toContain("object-meta:v1:c1:");
+    });
+
+    it("keeps default invalidation best-effort when the persisted deletion fails", async () => {
+      mocks.deleteSchemaCachePrefix.mockRejectedValue(new Error("sqlite locked"));
+
+      await expect(invalidateObjectDdlCache(connectionMatch)).resolves.toBeUndefined();
+      expect(objectPrefixes()).toEqual(["object-ddl:v1:c1:", "object-meta:v1:c1:"]);
+    });
+
+    it("still rejects in strict mode when a deletion rejects without a reason", async () => {
+      // A bare Promise.reject() has reason undefined; settled status, not the
+      // reason's value, must decide failure.
+      mocks.deleteSchemaCachePrefix.mockRejectedValue(undefined as never);
+
+      const failure = await invalidateObjectDdlCache(connectionMatch, { strict: true }).then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      expect(isObjectCacheInvalidationError(failure)).toBe(true);
+    });
+
+    it("lets a strict call sharing a pending best-effort deletion observe the failure", async () => {
+      const failAll = rejectAllDeletions(new Error("disk full"));
+
+      const bestEffort = invalidateObjectDdlCache(connectionMatch);
+      const strict = invalidateObjectDdlCache(connectionMatch, { strict: true });
+      // The strict call must reuse the in-flight deletions instead of starting new ones.
+      await vi.waitFor(() => expect(objectPrefixes()).toEqual(["object-ddl:v1:c1:", "object-meta:v1:c1:"]));
+
+      failAll();
+      await expect(bestEffort).resolves.toBeUndefined();
+      const failure = await strict.then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      expect(isObjectCacheInvalidationError(failure)).toBe(true);
+      expect((failure as Error).message).toBe("disk full");
+    });
+
+    it("retries the persisted deletion on the next strict invalidation after a failure", async () => {
+      mocks.deleteSchemaCachePrefix.mockRejectedValueOnce(new Error("locked")).mockRejectedValueOnce(new Error("locked"));
+
+      await expect(invalidateObjectDdlCache(connectionMatch, { strict: true })).rejects.toThrow("locked");
+
+      await expect(invalidateObjectDdlCache(connectionMatch, { strict: true })).resolves.toBeUndefined();
+      const prefixes = objectPrefixes();
+      expect(prefixes.filter((prefix) => prefix === "object-ddl:v1:c1:")).toHaveLength(2);
+      expect(prefixes.filter((prefix) => prefix === "object-meta:v1:c1:")).toHaveLength(2);
+    });
+
+    it("keeps non-force reads working when a concurrent deletion fails", async () => {
+      const failAll = rejectAllDeletions(new Error("locked"));
+      mocks.getTableDisplayDdl.mockResolvedValue("fresh ddl");
+
+      const invalidation = invalidateObjectDdlCache({ connectionId: request.connectionId, database: request.database, schema: request.schema, tableName: request.tableName });
+      const read = loadObjectDdl(request);
+      failAll();
+      await expect(read).resolves.toEqual({ ddl: "fresh ddl", cacheStatus: "remote" });
+      await expect(invalidation).resolves.toBeUndefined();
+    });
+
+    it("force refresh proceeds when the persisted deletion fails", async () => {
+      mocks.deleteSchemaCachePrefix.mockRejectedValue(new Error("locked"));
+      mocks.getTableDisplayDdl.mockResolvedValue("new ddl");
+
+      await expect(loadObjectDdl(request, { force: true })).resolves.toEqual({ ddl: "new ddl", cacheStatus: "remote" });
+    });
+
+    it("keeps object-level invalidation best-effort when the deletion fails", async () => {
+      mocks.deleteSchemaCachePrefix.mockRejectedValue(new Error("locked"));
+
+      await expect(invalidateObjectDdl(request)).resolves.toBeUndefined();
+    });
+
+    it("encodes connection ids and isolates similar ids in persisted deletions", async () => {
+      mocks.persisted.set("object-ddl:v1:conn10:db:public:t::TABLE:", { version: 1, cachedAt: new Date().toISOString(), ddl: "conn10 ddl" });
+
+      await invalidateObjectDdlCache({ connectionId: "conn1" });
+
+      expect(objectPrefixes()).toContain("object-ddl:v1:conn1:");
+      expect(objectPrefixes()).toContain("object-meta:v1:conn1:");
+      expect([...mocks.persisted.keys()]).toContain("object-ddl:v1:conn10:db:public:t::TABLE:");
+
+      await invalidateObjectDdlCache({ connectionId: "a:b c%中" });
+      expect(mocks.deleteSchemaCachePrefix).toHaveBeenCalledWith("object-ddl:v1:a%3Ab%20c%25%E4%B8%AD:");
+      expect(mocks.deleteSchemaCachePrefix).toHaveBeenCalledWith("object-meta:v1:a%3Ab%20c%25%E4%B8%AD:");
+    });
   });
 });

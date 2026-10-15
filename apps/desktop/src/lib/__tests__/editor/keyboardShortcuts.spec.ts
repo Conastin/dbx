@@ -1,24 +1,70 @@
+// @vitest-environment happy-dom
+
 import { describe, expect, it } from "vitest";
 import {
   eventToModifierOnlyShortcut,
   eventToShortcut,
+  isBrowserTaskManagerShortcut,
+  isCaretBrowsingShortcut,
+  shouldBlockCaretBrowsing,
   isConvertNamingStyleShortcut,
+  isEditCellShortcut,
+  isEditSidebarTableStructureShortcut,
   isEditTableStructureShortcut,
   isExecuteSqlInNewResultTabShortcut,
+  isExecuteSqlShortcut,
+  isDefaultQueryShortcutTarget,
   isGoToColumnShortcut,
+  isFocusWhereShortcut,
   isGoToFirstPageShortcut,
   isGoToLastPageShortcut,
   isGoToNextPageShortcut,
   isGoToPreviousPageShortcut,
   isToggleZenModeShortcut,
+  isSidebarFocusedTarget,
   isToggleAiPanelShortcut,
   matchesModifierOnlyShortcut,
   matchesShortcut,
   tabSwitcherDirectionFromShortcut,
 } from "@/lib/editor/keyboardShortcuts";
 import { formatShortcutDisplay, isMacShortcutPlatform } from "@/lib/editor/shortcutDisplay";
+import { shortcutToCodeMirrorKey } from "@/lib/editor/shortcutRegistry";
 
 describe("keyboard shortcut matching", () => {
+  it("routes Cmd+Enter by focus surface while preserving editor execution", () => {
+    const sidebar = document.createElement("div");
+    sidebar.dataset.appSidebar = "";
+    const row = document.createElement("button");
+    sidebar.append(row);
+    document.body.append(sidebar);
+
+    expect(isExecuteSqlShortcut({ key: "Enter", metaKey: true }, undefined)).toBe(true);
+    expect(isSidebarFocusedTarget(row, false)).toBe(true);
+    expect(isSidebarFocusedTarget(document.body, true)).toBe(true);
+    const editor = document.createElement("div");
+    editor.dataset.queryEditorRoot = "";
+    document.body.append(editor);
+    expect(isSidebarFocusedTarget(editor, false)).toBe(false);
+    expect(isSidebarFocusedTarget(document.createElement("textarea"), false)).toBe(false);
+    const objectSearch = document.createElement("input");
+    objectSearch.dataset.objectSearchInput = "";
+    document.body.append(objectSearch);
+    expect(isDefaultQueryShortcutTarget(objectSearch, false)).toBe(true);
+    expect(isDefaultQueryShortcutTarget(editor, false)).toBe(false);
+
+    sidebar.remove();
+    editor.remove();
+    objectSearch.remove();
+  });
+
+  it("matches configured WHERE focus on macOS and Windows while respecting a cleared binding", () => {
+    expect(isFocusWhereShortcut({ key: "L", metaKey: true, shiftKey: true }, { focusWhere: "Mod+Shift+L" }, "MacIntel")).toBe(true);
+    expect(isFocusWhereShortcut({ key: "L", ctrlKey: true, shiftKey: true }, { focusWhere: "Mod+Shift+L" }, "Win32")).toBe(true);
+    expect(isFocusWhereShortcut({ key: "L", ctrlKey: true, shiftKey: true }, { focusWhere: "" }, "Win32")).toBe(false);
+    expect(isFocusWhereShortcut({ key: "L", ctrlKey: true, shiftKey: true }, undefined, "Win32")).toBe(false);
+    expect(isFocusWhereShortcut({ key: "L", metaKey: true, shiftKey: true }, undefined, "MacIntel")).toBe(false);
+  });
+
   it("records modifier-only mouse shortcut settings", () => {
     expect(eventToModifierOnlyShortcut({ key: "Alt", altKey: true })).toBe("Alt");
     expect(eventToModifierOnlyShortcut({ key: "Shift", shiftKey: true })).toBe("Shift");
@@ -42,6 +88,31 @@ describe("keyboard shortcut matching", () => {
   it("records the plus key without losing it to the separator", () => {
     expect(eventToShortcut({ key: "+", ctrlKey: true }, "Win32")).toBe("Mod+Plus");
     expect(eventToShortcut({ key: "+", ctrlKey: true, shiftKey: true }, "Win32")).toBe("Shift+Mod+Plus");
+  });
+
+  it("records shifted punctuation by its unshifted key so CodeMirror can resolve the binding", () => {
+    // CodeMirror registers and looks up "Shift-" bindings against the physical
+    // key ("/"), never the shifted character ("?"), so recording "?" produced a
+    // binding that could never fire.
+    expect(eventToShortcut({ key: "?", code: "Slash", ctrlKey: true, shiftKey: true }, "Win32")).toBe("Shift+Mod+/");
+    expect(shortcutToCodeMirrorKey(eventToShortcut({ key: "?", code: "Slash", ctrlKey: true, shiftKey: true }, "Win32")!)).toBe("Shift-Mod-/");
+
+    expect(eventToShortcut({ key: "!", code: "Digit1", ctrlKey: true, shiftKey: true }, "Win32")).toBe("Shift+Mod+1");
+    expect(eventToShortcut({ key: ":", code: "Semicolon", altKey: true, shiftKey: true }, "Win32")).toBe("Shift+Alt+;");
+  });
+
+  it("matches a press against a shortcut stored with the unshifted key", () => {
+    const press = { key: "?", code: "Slash", ctrlKey: true, shiftKey: true };
+    expect(matchesShortcut(press, "Shift+Mod+/", "Win32")).toBe(true);
+    // The shifted character still matches, so shortcuts saved by older versions keep working.
+    expect(matchesShortcut(press, "Shift+Mod+?", "Win32")).toBe(true);
+    // A different physical key must not match.
+    expect(matchesShortcut({ key: "?", code: "Period", ctrlKey: true, shiftKey: true }, "Shift+Mod+/", "Win32")).toBe(false);
+  });
+
+  it("leaves unshifted and letter keys untouched", () => {
+    expect(eventToShortcut({ key: "/", code: "Slash", ctrlKey: true }, "Win32")).toBe("Mod+/");
+    expect(eventToShortcut({ key: "A", code: "KeyA", ctrlKey: true, shiftKey: true }, "Win32")).toBe("Shift+Mod+A");
   });
 
   it.each([
@@ -89,13 +160,37 @@ describe("keyboard shortcut matching", () => {
     const combinedShortcut = eventToShortcut({ key: "b", ctrlKey: true, metaKey: true, shiftKey: true, altKey: true }, "MacIntel");
 
     expect(combinedShortcut).toBe("Shift+Ctrl+Mod+Alt+B");
-    expect(matchesShortcut({ key: "b", ctrlKey: true, metaKey: true, shiftKey: true, altKey: true }, combinedShortcut!, "MacIntel")).toBe(true);
+    expect(
+      matchesShortcut(
+        {
+          key: "b",
+          ctrlKey: true,
+          metaKey: true,
+          shiftKey: true,
+          altKey: true,
+        },
+        combinedShortcut!,
+        "MacIntel",
+      ),
+    ).toBe(true);
     expect(matchesShortcut({ key: "b", ctrlKey: true, shiftKey: true, altKey: true }, combinedShortcut!, "MacIntel")).toBe(false);
     expect(matchesShortcut({ key: "b", metaKey: true, shiftKey: true, altKey: true }, combinedShortcut!, "MacIntel")).toBe(false);
 
     const nonMacCombinedShortcut = eventToShortcut({ key: "b", ctrlKey: true, metaKey: true, shiftKey: true, altKey: true }, "Win32");
     expect(nonMacCombinedShortcut).toBe("Shift+Mod+Meta+Alt+B");
-    expect(matchesShortcut({ key: "b", ctrlKey: true, metaKey: true, shiftKey: true, altKey: true }, nonMacCombinedShortcut!, "Win32")).toBe(true);
+    expect(
+      matchesShortcut(
+        {
+          key: "b",
+          ctrlKey: true,
+          metaKey: true,
+          shiftKey: true,
+          altKey: true,
+        },
+        nonMacCombinedShortcut!,
+        "Win32",
+      ),
+    ).toBe(true);
     expect(matchesShortcut({ key: "b", ctrlKey: true, shiftKey: true, altKey: true }, nonMacCombinedShortcut!, "Win32")).toBe(false);
     expect(matchesShortcut({ key: "b", metaKey: true, shiftKey: true, altKey: true }, nonMacCombinedShortcut!, "Win32")).toBe(false);
   });
@@ -109,7 +204,11 @@ describe("keyboard shortcut matching", () => {
     const isMac = isMacShortcutPlatform();
     const platformModEvent = isMac ? { key: "\\", metaKey: true } : { key: "\\", ctrlKey: true };
 
-    expect(isExecuteSqlInNewResultTabShortcut(platformModEvent, { executeSqlInNewResultTab: "Mod+\\" })).toBe(true);
+    expect(
+      isExecuteSqlInNewResultTabShortcut(platformModEvent, {
+        executeSqlInNewResultTab: "Mod+\\",
+      }),
+    ).toBe(true);
     expect(isExecuteSqlInNewResultTabShortcut({ ...platformModEvent, shiftKey: true }, { executeSqlInNewResultTab: "Mod+\\" })).toBe(false);
     expect(isExecuteSqlInNewResultTabShortcut({ key: "\\", ctrlKey: true }, { executeSqlInNewResultTab: "Mod+\\" })).toBe(!isMac);
     expect(isExecuteSqlInNewResultTabShortcut({ key: "\\", metaKey: true }, { executeSqlInNewResultTab: "Mod+\\" })).toBe(true);
@@ -118,7 +217,11 @@ describe("keyboard shortcut matching", () => {
   it("matches the configurable Zen mode shortcut", () => {
     const platformModEvent = isMacShortcutPlatform() ? { key: "F12", metaKey: true, shiftKey: true } : { key: "F12", ctrlKey: true, shiftKey: true };
 
-    expect(isToggleZenModeShortcut(platformModEvent, { toggleZenMode: "Shift+Mod+F12" })).toBe(true);
+    expect(
+      isToggleZenModeShortcut(platformModEvent, {
+        toggleZenMode: "Shift+Mod+F12",
+      }),
+    ).toBe(true);
     expect(isToggleZenModeShortcut({ ...platformModEvent, shiftKey: false }, { toggleZenMode: "Shift+Mod+F12" })).toBe(false);
     expect(isToggleZenModeShortcut(platformModEvent, { toggleZenMode: "" })).toBe(false);
   });
@@ -147,6 +250,22 @@ describe("keyboard shortcut matching", () => {
     expect(isGoToColumnShortcut({ key: "g", ctrlKey: true, isComposing: true }, { goToColumn: "Mod+G" })).toBe(false);
   });
 
+  it("matches the edit-cell shortcut F2 by default on Windows and macOS", () => {
+    expect(isEditCellShortcut({ key: "F2" }, undefined, "Win32")).toBe(true);
+    expect(isEditCellShortcut({ key: "F2" }, undefined, "MacIntel")).toBe(true);
+    expect(isEditCellShortcut({ key: "F2", ctrlKey: true }, undefined, "Win32")).toBe(false);
+    expect(isEditCellShortcut({ key: "F2", shiftKey: true }, undefined, "Win32")).toBe(false);
+    expect(isEditCellShortcut({ key: "F2", altKey: true }, undefined, "Win32")).toBe(false);
+    expect(isEditCellShortcut({ key: "F3" }, undefined, "Win32")).toBe(false);
+  });
+
+  it("honors custom and disabled edit-cell shortcuts", () => {
+    expect(isEditCellShortcut({ key: "e", ctrlKey: true }, { editCell: "Mod+E" }, "Win32")).toBe(true);
+    expect(isEditCellShortcut({ key: "F2" }, { editCell: "Mod+E" }, "Win32")).toBe(false);
+    expect(isEditCellShortcut({ key: "F2" }, { editCell: "" }, "Win32")).toBe(false);
+    expect(isEditCellShortcut({ key: "F2", isComposing: true }, undefined, "Win32")).toBe(false);
+  });
+
   it("matches the edit-table-structure shortcut on Windows and macOS", () => {
     expect(isEditTableStructureShortcut({ key: "d", ctrlKey: true, shiftKey: true }, undefined, "Win32")).toBe(true);
     expect(isEditTableStructureShortcut({ key: "d", metaKey: true, shiftKey: true }, undefined, "MacIntel")).toBe(true);
@@ -159,6 +278,19 @@ describe("keyboard shortcut matching", () => {
     expect(isEditTableStructureShortcut({ key: "d", ctrlKey: true }, { editTableStructure: "Shift+Mod+E" }, "Win32")).toBe(false);
     expect(isEditTableStructureShortcut({ key: "d", ctrlKey: true }, { editTableStructure: "" }, "Win32")).toBe(false);
     expect(isEditTableStructureShortcut({ key: "d", ctrlKey: true, isComposing: true }, undefined, "Win32")).toBe(false);
+  });
+
+  it("matches the sidebar edit-table-structure shortcut F4", () => {
+    expect(isEditSidebarTableStructureShortcut({ key: "F4" }, undefined, "Win32")).toBe(true);
+    expect(isEditSidebarTableStructureShortcut({ key: "F4" }, undefined, "MacIntel")).toBe(true);
+    expect(isEditSidebarTableStructureShortcut({ key: "F4", ctrlKey: true }, undefined, "Win32")).toBe(false);
+  });
+
+  it("honors custom and disabled sidebar edit-table-structure shortcuts", () => {
+    expect(isEditSidebarTableStructureShortcut({ key: "s", ctrlKey: true, altKey: true }, { editSidebarTableStructure: "Mod+Alt+S" }, "Win32")).toBe(true);
+    expect(isEditSidebarTableStructureShortcut({ key: "F4" }, { editSidebarTableStructure: "Mod+Alt+S" }, "Win32")).toBe(false);
+    expect(isEditSidebarTableStructureShortcut({ key: "F4" }, { editSidebarTableStructure: "" }, "Win32")).toBe(false);
+    expect(isEditSidebarTableStructureShortcut({ key: "F4", isComposing: true }, undefined, "Win32")).toBe(false);
   });
 
   it.each([
@@ -195,5 +327,58 @@ describe("tabSwitcherDirectionFromShortcut", () => {
   it("honors a remapped shortcut and does not reverse when it already uses Shift", () => {
     expect(tabSwitcherDirectionFromShortcut({ key: "Tab", ctrlKey: true, shiftKey: true }, { tabSwitcher: "Shift+Ctrl+Tab" })).toBe(1);
     expect(tabSwitcherDirectionFromShortcut({ key: "Tab", ctrlKey: true }, { tabSwitcher: "Shift+Ctrl+Tab" })).toBeNull();
+  });
+});
+
+describe("isBrowserTaskManagerShortcut", () => {
+  it("matches Shift+Escape combinations and rejects regular Escape or extra modifiers", () => {
+    expect(isBrowserTaskManagerShortcut({ key: "Escape", shiftKey: true })).toBe(true);
+    expect(isBrowserTaskManagerShortcut({ key: "Esc", shiftKey: true })).toBe(true);
+    expect(isBrowserTaskManagerShortcut({ code: "Escape", shiftKey: true, key: "Unidentified" })).toBe(true);
+
+    expect(isBrowserTaskManagerShortcut({ key: "Escape" })).toBe(false);
+    expect(isBrowserTaskManagerShortcut({ key: "Escape", shiftKey: false })).toBe(false);
+    expect(isBrowserTaskManagerShortcut({ key: "Escape", shiftKey: true, ctrlKey: true })).toBe(false);
+    expect(isBrowserTaskManagerShortcut({ key: "Escape", shiftKey: true, metaKey: true })).toBe(false);
+    expect(isBrowserTaskManagerShortcut({ key: "Escape", shiftKey: true, altKey: true })).toBe(false);
+    expect(isBrowserTaskManagerShortcut({ key: "Escape", shiftKey: true, isComposing: true })).toBe(false);
+    expect(isBrowserTaskManagerShortcut({ key: "x", shiftKey: true })).toBe(false);
+  });
+});
+
+describe("isCaretBrowsingShortcut", () => {
+  it("matches F7 key and code without modifiers", () => {
+    expect(isCaretBrowsingShortcut({ key: "F7" })).toBe(true);
+    expect(isCaretBrowsingShortcut({ code: "F7", key: "Unidentified" })).toBe(true);
+    expect(isCaretBrowsingShortcut({ key: "F7", code: "F7" })).toBe(true);
+
+    expect(isCaretBrowsingShortcut({ key: "F7", ctrlKey: true })).toBe(false);
+    expect(isCaretBrowsingShortcut({ key: "F7", metaKey: true })).toBe(false);
+    expect(isCaretBrowsingShortcut({ key: "F7", altKey: true })).toBe(false);
+    expect(isCaretBrowsingShortcut({ key: "F7", shiftKey: true })).toBe(false);
+    expect(isCaretBrowsingShortcut({ key: "F7", isComposing: true })).toBe(false);
+    expect(isCaretBrowsingShortcut({ key: "F8" })).toBe(false);
+  });
+});
+
+describe("shouldBlockCaretBrowsing", () => {
+  it("blocks F7 when caretBrowsingEnabled is false or unset", () => {
+    expect(shouldBlockCaretBrowsing({ key: "F7" })).toBe(true);
+    expect(shouldBlockCaretBrowsing({ key: "F7" }, { caretBrowsingEnabled: false })).toBe(true);
+  });
+
+  it("does not block when caretBrowsingEnabled is true", () => {
+    expect(shouldBlockCaretBrowsing({ key: "F7" }, { caretBrowsingEnabled: true })).toBe(false);
+  });
+
+  it("does not block non-F7 keys or modified keys", () => {
+    expect(shouldBlockCaretBrowsing({ key: "F5" })).toBe(false);
+    expect(shouldBlockCaretBrowsing({ key: "F7", ctrlKey: true })).toBe(false);
+    expect(shouldBlockCaretBrowsing({ key: "F7", shiftKey: true })).toBe(false);
+  });
+
+  it("does not block when F7 is bound to a custom shortcut action", () => {
+    expect(shouldBlockCaretBrowsing({ key: "F7" }, { caretBrowsingEnabled: false, shortcuts: { executeSql: "F7" } })).toBe(false);
+    expect(shouldBlockCaretBrowsing({ key: "F7" }, { caretBrowsingEnabled: false, shortcuts: { executeSql: "Ctrl+Enter" } })).toBe(true);
   });
 });

@@ -4,6 +4,7 @@ import { useI18n } from "vue-i18n";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useQueryStore } from "@/stores/queryStore";
 import { useSettingsStore } from "@/stores/settingsStore";
+import { useToast } from "@/composables/useToast";
 import EditorGroupTabBar from "./EditorGroupTabBar.vue";
 import EditorToolbar from "./EditorToolbar.vue";
 import QueryEditorSurface from "./QueryEditorSurface.vue";
@@ -13,9 +14,13 @@ import { createContentSurfaceEventForwarders } from "@/lib/tabs/contentSurfaceEv
 import { isPreviewTab } from "@/lib/tabs/tabPresentation";
 import { resolveExecutableSql } from "@/lib/sql/sqlExecutionTarget";
 import { effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
+import { usesProvenReadOnlyStickyTransactionState } from "@/lib/database/databaseFeatureSupport";
+import * as api from "@/lib/backend/api";
+import { externalSqlEditorMaxBytes, externalSqlFileOpenErrorMessage } from "@/lib/sql/sqlFileOpen";
 import { GROUP_TAB_BAR_PORTAL } from "./groupTabBarPortal";
 import type { ContentAreaSurfaceEmits, ContentAreaSurfaceProps, QueryEditorSurfaceHandle, StatementRange } from "./querySurfaces";
-import type { QueryTab } from "@/types/database";
+import type { QueryTab, TableInfoTab } from "@/types/database";
+import type { AiConversationBinding } from "@/lib/ai/aiConversationBinding";
 
 defineOptions({ inheritAttrs: false });
 
@@ -30,6 +35,8 @@ const props = defineProps<
     tabBarCollapsed?: boolean;
     canDetachTabs?: boolean;
     detachedDropTarget?: boolean;
+    /** Collapse the group to its tab strip while a plugin workbench tab owns the layout. */
+    contentSuppressed?: boolean;
   }
 >();
 
@@ -39,9 +46,8 @@ const emit = defineEmits<
   ContentAreaSurfaceEmits & {
     "focus-group": [groupId: string];
     "activate-tab": [tabId: string];
-    "locate-tab": [tab: QueryTab];
     "toggle-zen-mode": [];
-    "start-resize": [event: MouseEvent];
+    "start-resize": [event: PointerEvent];
     "toggle-collapse": [];
     "detach-tab": [tab: QueryTab];
   }
@@ -56,6 +62,7 @@ const surfaceProps = computed<ContentAreaSurfaceProps>(() => ({
   activeOutputView: props.activeOutputView,
   formatSqlRequest: props.formatSqlRequest,
   compressSqlRequest: props.compressSqlRequest,
+  keywordCaseRequest: props.keywordCaseRequest,
   selectedSql: props.selectedSql,
   cursorPos: props.cursorPos,
   blockDangerousRedisCommands: props.blockDangerousRedisCommands,
@@ -67,8 +74,10 @@ const surfaceBindings = computed(() => ({ ...surfaceProps.value, ...contentEmits
 const activeSurfaceRef = ref<QueryEditorSurfaceHandle | null>(null);
 
 defineExpose({
-  focusSearch: () => activeSurfaceRef.value?.focusSearch() ?? false,
+  focusSearch: (target: Element | null = null) => activeSurfaceRef.value?.focusSearch(target) ?? false,
+  focusWhere: () => activeSurfaceRef.value?.focusWhere() ?? false,
   openGoToColumn: () => activeSurfaceRef.value?.openGoToColumn() ?? false,
+  openTableStructureEditor: (initialTab?: TableInfoTab) => activeSurfaceRef.value?.openTableStructureEditor?.(initialTab) ?? false,
   refreshData: () => activeSurfaceRef.value?.refreshData() ?? false,
   toggleResultsPane: () => activeSurfaceRef.value?.toggleResultsPane() ?? false,
   refreshQueryEditorCompletionCache: () => activeSurfaceRef.value?.refreshQueryEditorCompletionCache() ?? false,
@@ -82,30 +91,55 @@ defineExpose({
   acceptQueryEditorExecutionViewport: (requestId: number) => activeSurfaceRef.value?.acceptQueryEditorExecutionViewport(requestId) ?? false,
   pasteClipboardAsSqlInCondition: () => activeSurfaceRef.value?.pasteClipboardAsSqlInCondition() ?? Promise.resolve(false),
   applyTableStructureChanges: () => activeSurfaceRef.value?.applyTableStructureChanges() ?? Promise.resolve(false),
-  insertRedisCommand: (command: string) => activeSurfaceRef.value?.insertRedisCommand(command) ?? Promise.resolve(false),
-  executeRedisCommand: (command: string) => activeSurfaceRef.value?.executeRedisCommand(command) ?? Promise.resolve(false),
+  insertRedisCommand: (command: string, target: AiConversationBinding) => activeSurfaceRef.value?.insertRedisCommand(command, target) ?? Promise.resolve(false),
+  executeRedisCommand: (command: string, target: AiConversationBinding) => activeSurfaceRef.value?.executeRedisCommand(command, target) ?? Promise.resolve(false),
+  isRedisConsoleReady: (target: AiConversationBinding) => activeSurfaceRef.value?.isRedisConsoleReady(target) ?? false,
   previewStatementRange: (tabId: string, range: StatementRange | null) => (activeTab.value?.id === tabId ? (activeSurfaceRef.value?.previewStatementRange(range) ?? false) : false),
   focusStatementRange: (tabId: string, range: StatementRange | null) => (activeTab.value?.id === tabId ? (activeSurfaceRef.value?.focusStatementRange(range) ?? false) : false),
+  focusErrorPosition: (tabId: string, offset: number) => (activeTab.value?.id === tabId ? (activeSurfaceRef.value?.focusErrorPosition(offset) ?? false) : false),
 });
 
 const { t } = useI18n();
 const connectionStore = useConnectionStore();
 const queryStore = useQueryStore();
 const settingsStore = useSettingsStore();
+const { toast } = useToast();
 const toolbar = inject(EDITOR_TOOLBAR_ACTIONS, createNoopEditorToolbarActions());
 const tabBarPortal = inject(GROUP_TAB_BAR_PORTAL, null);
 const tabBarTarget = computed(() => {
   if (!tabBarPortal?.active.value) return undefined;
   return tabBarPortal.targets.get(props.groupId);
 });
+
 const groupTabs = computed(() => {
   const byId = new Map(queryStore.tabs.map((tab) => [tab.id, tab]));
   return props.tabIds.map((id) => byId.get(id)).filter((tab): tab is QueryTab => !!tab);
 });
 const activeTab = computed(() => groupTabs.value.find((tab) => tab.id === props.activeTabId) ?? groupTabs.value[0] ?? null);
 const activeConnection = computed(() => (activeTab.value ? connectionStore.getConfig(activeTab.value.connectionId) : undefined));
-const showGroupToolbar = computed(() => activeTab.value?.mode === "query" && !isPreviewTab(activeTab.value));
-const isGroupOracleManualTransaction = computed(() => effectiveDatabaseTypeForConnection(activeConnection.value) === "oracle" && (activeTab.value?.autoCommit ?? true) === false);
+const showGroupToolbar = computed(() => activeTab.value?.mode === "query" && !activeTab.value.ddlViewer && !isPreviewTab(activeTab.value));
+
+let encodingRequest = 0;
+async function changeExternalSqlEncoding(encoding: NonNullable<QueryTab["externalSqlEncoding"]>) {
+  const tab = activeTab.value;
+  if (!tab?.externalSqlPath) return;
+  const request = ++encodingRequest;
+  if (queryStore.isTabDirty(tab) && !window.confirm(t("externalSqlFile.unsavedWarning"))) return;
+  const path = tab.externalSqlPath;
+  const sql = tab.sql;
+  const version = tab.externalSqlFileVersion;
+  const stillCurrent = () => request === encodingRequest && queryStore.tabs.includes(tab) && tab.externalSqlPath === path && tab.sql === sql && tab.externalSqlFileVersion === version;
+  try {
+    const snapshot = await api.readExternalSqlFileSnapshot(tab.externalSqlPath, externalSqlEditorMaxBytes(settingsStore.editorSettings.externalSqlEditorMaxMb), encoding);
+    if (!stillCurrent()) return;
+    queryStore.applyExternalSqlFileSnapshot(tab.id, snapshot.content, snapshot.version);
+    tab.externalSqlEncoding = snapshot.encoding ?? encoding;
+  } catch (error) {
+    if (!stillCurrent()) return;
+    toast(t("toolbar.sqlOpenFailed", { message: externalSqlFileOpenErrorMessage(error, (key, params) => t(key, params)) }), 5000);
+  }
+}
+const isGroupStickyManualTransaction = computed(() => usesProvenReadOnlyStickyTransactionState(effectiveDatabaseTypeForConnection(activeConnection.value)) && (activeTab.value?.autoCommit ?? true) === false);
 // Each group previews the executable SQL of its own active tab (selection
 // stored on the tab), not the focused tab's global selection.
 // tabPlacement drives each pane's own bar position: the strip sits above,
@@ -138,7 +172,7 @@ const groupExecutableSql = computed(() => {
 </script>
 
 <template>
-  <div class="editor-group flex h-full min-h-0 min-w-0 overflow-hidden" :class="[groupClass, groupLayoutClass]" :data-group-id="groupId" @pointerdown.capture="$emit('focus-group', groupId)" @focusin="$emit('focus-group', groupId)">
+  <div class="editor-group flex min-h-0 min-w-0 overflow-hidden" :class="[contentSuppressed ? '' : 'h-full', groupClass, groupLayoutClass]" :data-group-id="groupId" @pointerdown.capture="$emit('focus-group', groupId)" @focusin="$emit('focus-group', groupId)">
     <Teleport defer v-if="showTabNavigation !== false" :to="tabBarTarget" :disabled="!tabBarPortal?.active.value || !tabBarTarget">
       <EditorGroupTabBar
         :group-id="groupId"
@@ -157,13 +191,17 @@ const groupExecutableSql = computed(() => {
         @detach-tab="$emit('detach-tab', $event)"
         @activate-settings="toolbar.activateSettingsPage()"
         @close-settings="toolbar.closeSettingsPage()"
+        @activate-plugin-center="toolbar.activatePluginCenter()"
+        @close-plugin-center="toolbar.closePluginCenter()"
         @activate-driver-store="toolbar.activateDriverStore()"
         @close-driver-store="toolbar.closeDriverStore()"
       />
     </Teleport>
     <!-- The toolbar stays at the top of the pane's content column in every
-         placement; only the tab bar moves around it. -->
-    <div class="flex min-h-0 min-w-0 flex-1 flex-col">
+         placement; only the tab bar moves around it. While contentSuppressed
+         (plugin workbench tab active) the whole column yields to the
+         always-mounted plugin layer and the group collapses to its strip. -->
+    <div v-show="!contentSuppressed" class="flex min-h-0 min-w-0 flex-1 flex-col">
       <EditorToolbar
         v-if="activeTab && showGroupToolbar"
         :active-tab="activeTab"
@@ -176,8 +214,11 @@ const groupExecutableSql = computed(() => {
         :auto-commit="activeTab.autoCommit ?? true"
         :txn-session-id="activeTab.txnSessionId"
         :txn-auto-rolled-back="activeTab.txnAutoRolledBack"
-        :oracle-txn-possibly-dirty="activeTab.oracleTxnPossiblyDirty"
-        :is-oracle-manual-transaction="isGroupOracleManualTransaction"
+        :txn-possibly-dirty="activeTab.txnPossiblyDirty"
+        :auto-commit-open-transaction="activeTab.autoCommitOpenTransaction"
+        :auto-commit-txn-rolled-back="activeTab.autoCommitTxnRolledBack"
+        :auto-commit-session-txn-rolled-back="activeTab.autoCommitSessionTxnRolledBack"
+        :sticky-proven-read-only-state="isGroupStickyManualTransaction"
         @update:explain-mode="(m: 'explain' | 'autotrace') => (toolbar.explainMode.value = m)"
         @update:block-dangerous-redis-commands="(v: boolean) => (toolbar.blockDangerousRedisCommands.value = v)"
         @update:auto-commit="
@@ -190,16 +231,22 @@ const groupExecutableSql = computed(() => {
         @commit="activeTab && queryStore.commitTransaction(activeTab.id)"
         @rollback="activeTab && queryStore.rollbackTransaction(activeTab.id)"
         @dismiss-txn-rolled-back="activeTab && (activeTab.txnAutoRolledBack = false)"
-        @execute-pointer-down="toolbar.captureExecutionSnapshot()"
-        @toolbar-execute="toolbar.toolbarExecute($event)"
+        @dismiss-auto-commit-txn-rolled-back="activeTab && (activeTab.autoCommitTxnRolledBack = false)"
+        @dismiss-auto-commit-session-txn-rolled-back="activeTab && (activeTab.autoCommitSessionTxnRolledBack = false)"
+        @execute-pointer-down="toolbar.captureExecutionSnapshot(activeTab.id)"
+        @toolbar-execute="toolbar.toolbarExecute($event, activeTab.id)"
+        @toolbar-execute-in-new-result-tab="toolbar.toolbarExecuteInNewResultTab($event, activeTab.id)"
         @multi-execute="toolbar.multiExecute()"
         @preview-changes="activeTab && toolbar.previewChanges(activeTab.id)"
         @cancel="activeTab && toolbar.cancelExecution(activeTab.id)"
         @explain="activeTab && toolbar.explain(activeTab.id)"
         @format-sql="activeTab && toolbar.formatSql(activeTab.id)"
         @compress-sql="activeTab && toolbar.compressSql(activeTab.id)"
-        @toggle-sql-keyword-case="toolbar.toggleSqlKeywordCase()"
+        @fold-all="activeSurfaceRef?.foldAll?.()"
+        @unfold-all="activeSurfaceRef?.unfoldAll?.()"
+        @toggle-sql-keyword-case="activeTab && toolbar.toggleSqlKeywordCase(activeTab.id)"
         @save-sql="(tabId: string) => toolbar.saveSql(tabId)"
+        @change-encoding="changeExternalSqlEncoding"
         @open-sql="toolbar.openSqlFile()"
         @import-result-archive="toolbar.importResultArchive()"
         @paste-sql-in-condition="toolbar.pasteSqlInCondition()"

@@ -1,5 +1,5 @@
 // @vitest-environment happy-dom
-import { createApp, nextTick } from "vue";
+import { createApp, h, nextTick, reactive, ref } from "vue";
 import { createPinia, setActivePinia } from "pinia";
 import { createI18n } from "vue-i18n";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -63,6 +63,10 @@ vi.mock("@/components/common/ProductionContextBadge.vue", () => ({
 
 import EditorToolbar from "../EditorToolbar.vue";
 import { useConnectionStore } from "@/stores/connectionStore";
+import { useSettingsStore } from "@/stores/settingsStore";
+import { resolveExecutableSql, type SqlExecutionSnapshot } from "@/lib/sql/sqlExecutionTarget";
+import QueryEditor from "@/components/editor/QueryEditor.vue";
+import { EditorView } from "@codemirror/view";
 
 function createHost(): HTMLDivElement {
   const host = document.createElement("div");
@@ -119,8 +123,8 @@ describe("EditorToolbar mount contract", () => {
       autoCommit: true,
       txnSessionId: undefined,
       txnAutoRolledBack: false,
-      oracleTxnPossiblyDirty: false,
-      isOracleManualTransaction: false,
+      txnPossiblyDirty: false,
+      stickyProvenReadOnlyState: false,
       onToolbarExecute,
     });
     app.use(pinia);
@@ -136,6 +140,328 @@ describe("EditorToolbar mount contract", () => {
 
     expect(onToolbarExecute).toHaveBeenCalledTimes(1);
     expect(onToolbarExecute.mock.calls[0]?.[0]).toBe("pointer");
+
+    app.unmount();
+    host.remove();
+  });
+
+  it("keeps the manually selected SQL from pointer-down through toolbar execution", async () => {
+    const connectionStore = useConnectionStore();
+    connectionStore.connections = [
+      {
+        id: "conn-1",
+        name: "conn",
+        db_type: "postgres",
+        color: "",
+      } as never,
+    ];
+
+    const fullSql = "SELECT first_value;\nSELECT selected_value;";
+    const selectedSql = "SELECT selected_value;";
+    const snapshot = {
+      fullSql,
+      selectedSql,
+      cursorPos: fullSql.length,
+      selectionFrom: fullSql.indexOf(selectedSql),
+      selectionTo: fullSql.length,
+    };
+    let pendingSnapshot: typeof snapshot | undefined;
+    let executedSql = "";
+    const onExecutePointerDown = vi.fn(() => {
+      pendingSnapshot = snapshot;
+    });
+    const onToolbarExecute = vi.fn((source: "pointer" | "keyboard") => {
+      executedSql = source === "pointer" && pendingSnapshot ? resolveExecutableSql(pendingSnapshot.fullSql, pendingSnapshot.selectedSql, { mode: "current", cursorPos: pendingSnapshot.cursorPos }) : fullSql;
+    });
+
+    const host = createHost();
+    const app = createApp(EditorToolbar, {
+      activeTab: {
+        id: "tab-1",
+        title: "SQL",
+        connectionId: "conn-1",
+        database: "db",
+        sql: fullSql,
+        mode: "query",
+        isExecuting: false,
+        isCancelling: false,
+        isExplaining: false,
+      },
+      activeConnection: connectionStore.getConfig("conn-1"),
+      executableSql: selectedSql,
+      explainMode: "explain",
+      blockDangerousRedisCommands: false,
+      sqlKeywordCase: "preserve",
+      databaseRequiredSignal: 0,
+      autoCommit: true,
+      txnSessionId: undefined,
+      txnAutoRolledBack: false,
+      txnPossiblyDirty: false,
+      stickyProvenReadOnlyState: false,
+      onExecutePointerDown,
+      onToolbarExecute,
+    });
+    app.use(pinia);
+    app.use(i18n);
+    app.mount(host);
+    await nextTick();
+
+    const runButton = host.querySelectorAll("button")[0];
+    runButton?.dispatchEvent(new MouseEvent("mousedown", { button: 0, bubbles: true, cancelable: true }));
+    runButton?.dispatchEvent(new MouseEvent("click", { detail: 1, bubbles: true }));
+    await nextTick();
+
+    expect(onExecutePointerDown).toHaveBeenCalledTimes(1);
+    expect(onToolbarExecute).toHaveBeenCalledWith("pointer");
+    expect(onExecutePointerDown.mock.invocationCallOrder[0]).toBeLessThan(onToolbarExecute.mock.invocationCallOrder[0]!);
+    expect(executedSql).toBe(selectedSql);
+
+    app.unmount();
+    host.remove();
+  });
+
+  it("keeps the exact CodeMirror selection for regular and new-result toolbar execution", async () => {
+    const connectionStore = useConnectionStore();
+    const connection = {
+      id: "conn-1",
+      name: "conn",
+      db_type: "postgres",
+      color: "",
+    } as never;
+    connectionStore.connections = [connection];
+
+    const fullSql = "SELECT first_value;\nSELECT selected_value;";
+    const selectedSql = "SELECT selected_value;";
+    const selectionFrom = fullSql.indexOf(selectedSql);
+    const editorRef = ref<{ captureExecutionSnapshot?: () => SqlExecutionSnapshot | undefined } | null>(null);
+    const state = reactive({ sql: fullSql });
+    let pendingSnapshot: SqlExecutionSnapshot | undefined;
+    let executedSql = "";
+    let executedInNewResultSql = "";
+
+    const host = createHost();
+    const app = createApp({
+      setup() {
+        return () =>
+          h("div", [
+            h(QueryEditor, {
+              ref: editorRef,
+              modelValue: state.sql,
+              tabId: "tab-1",
+              connectionId: "conn-1",
+              database: "db",
+              databaseType: "postgres",
+              dialect: "postgres",
+              autoFocus: false,
+              "onUpdate:modelValue": (value: string) => (state.sql = value),
+            }),
+            h(EditorToolbar, {
+              activeTab: {
+                id: "tab-1",
+                title: "SQL",
+                connectionId: "conn-1",
+                database: "db",
+                sql: fullSql,
+                mode: "query",
+                isExecuting: false,
+                isCancelling: false,
+                isExplaining: false,
+              },
+              activeConnection: connection,
+              executableSql: fullSql,
+              explainMode: "explain",
+              blockDangerousRedisCommands: false,
+              sqlKeywordCase: "preserve",
+              databaseRequiredSignal: 0,
+              autoCommit: true,
+              txnSessionId: undefined,
+              txnAutoRolledBack: false,
+              txnPossiblyDirty: false,
+              stickyProvenReadOnlyState: false,
+              onExecutePointerDown: () => {
+                pendingSnapshot = editorRef.value?.captureExecutionSnapshot?.();
+              },
+              onToolbarExecute: (source: "pointer" | "keyboard") => {
+                executedSql = source === "pointer" && pendingSnapshot ? resolveExecutableSql(pendingSnapshot.fullSql, pendingSnapshot.selectedSql, { mode: "current", cursorPos: pendingSnapshot.cursorPos }) : fullSql;
+              },
+              onToolbarExecuteInNewResultTab: (source: "pointer" | "keyboard") => {
+                executedInNewResultSql = source === "pointer" && pendingSnapshot ? resolveExecutableSql(pendingSnapshot.fullSql, pendingSnapshot.selectedSql, { mode: "current", cursorPos: pendingSnapshot.cursorPos }) : fullSql;
+              },
+            }),
+          ]);
+      },
+    });
+    app.use(pinia);
+    app.use(i18n);
+    app.mount(host);
+    await vi.waitFor(() => expect(host.querySelector(".cm-editor")).not.toBeNull(), { timeout: 5000 });
+
+    const view = EditorView.findFromDOM(host.querySelector(".cm-editor") as HTMLElement)!;
+    view.dispatch({ selection: { anchor: selectionFrom, head: fullSql.length } });
+    expect(view.state.sliceDoc(view.state.selection.main.from, view.state.selection.main.to)).toBe(selectedSql);
+
+    const runButton = host.querySelector<HTMLElement>(".app-editor-toolbar button");
+    runButton?.dispatchEvent(new MouseEvent("mousedown", { button: 0, bubbles: true, cancelable: true }));
+    runButton?.dispatchEvent(new MouseEvent("click", { detail: 1, bubbles: true }));
+    await nextTick();
+
+    expect(pendingSnapshot?.selectedSql).toBe(selectedSql);
+    expect(executedSql).toBe(selectedSql);
+
+    const newResultButton = host.querySelector<HTMLButtonElement>('button[aria-label="settings.shortcutExecuteSqlInNewResultTab"]');
+    expect(newResultButton).not.toBeNull();
+    expect(newResultButton?.disabled).toBe(false);
+    newResultButton?.dispatchEvent(new MouseEvent("mousedown", { button: 0, bubbles: true, cancelable: true }));
+    newResultButton?.dispatchEvent(new MouseEvent("click", { detail: 1, bubbles: true }));
+    await nextTick();
+
+    expect(pendingSnapshot?.selectedSql).toBe(selectedSql);
+    expect(executedInNewResultSql).toBe(selectedSql);
+
+    app.unmount();
+    host.remove();
+  });
+
+  it("disables new-result execution when there is no executable SQL", async () => {
+    const connectionStore = useConnectionStore();
+    connectionStore.connections = [
+      {
+        id: "conn-empty",
+        name: "empty",
+        db_type: "mysql",
+        color: "",
+      } as never,
+    ];
+
+    const host = createHost();
+    const onToolbarExecuteInNewResultTab = vi.fn();
+    const app = createApp(EditorToolbar, {
+      activeTab: {
+        id: "tab-empty",
+        title: "SQL",
+        connectionId: "conn-empty",
+        database: "db",
+        sql: "",
+        mode: "query",
+        isExecuting: false,
+        isCancelling: false,
+        isExplaining: false,
+      },
+      activeConnection: connectionStore.getConfig("conn-empty"),
+      executableSql: "",
+      explainMode: "explain",
+      blockDangerousRedisCommands: false,
+      sqlKeywordCase: "preserve",
+      databaseRequiredSignal: 0,
+      autoCommit: true,
+      txnSessionId: undefined,
+      txnAutoRolledBack: false,
+      txnPossiblyDirty: false,
+      stickyProvenReadOnlyState: false,
+      onToolbarExecuteInNewResultTab,
+    });
+    app.use(pinia);
+    app.use(i18n);
+    app.mount(host);
+    await nextTick();
+
+    const newResultButton = host.querySelector<HTMLButtonElement>('button[aria-label="settings.shortcutExecuteSqlInNewResultTab"]');
+    expect(newResultButton).not.toBeNull();
+    expect(newResultButton?.disabled).toBe(true);
+    newResultButton?.click();
+    expect(onToolbarExecuteInNewResultTab).not.toHaveBeenCalled();
+
+    app.unmount();
+    host.remove();
+  });
+
+  it("toggles word wrap from the SQL toolbar and updates the mounted editor", async () => {
+    const connectionStore = useConnectionStore();
+    const settingsStore = useSettingsStore();
+    const connection = {
+      id: "conn-1",
+      name: "conn",
+      db_type: "mysql",
+      color: "",
+    } as never;
+    connectionStore.connections = [connection];
+    settingsStore.editorSettings.wordWrap = false;
+
+    const sql = "SELECT this_is_a_very_long_column_name FROM this_is_a_very_long_table_name";
+    const forceWordWrap = ref(false);
+    const host = createHost();
+    const app = createApp({
+      setup() {
+        return () =>
+          h("div", [
+            h(QueryEditor, {
+              modelValue: sql,
+              tabId: "tab-1",
+              connectionId: "conn-1",
+              database: "db",
+              databaseType: "mysql",
+              dialect: "mysql",
+              forceWordWrap: forceWordWrap.value,
+              autoFocus: false,
+            }),
+            h(EditorToolbar, {
+              activeTab: {
+                id: "tab-1",
+                title: "SQL",
+                connectionId: "conn-1",
+                database: "db",
+                sql,
+                mode: "query",
+                isExecuting: false,
+                isCancelling: false,
+                isExplaining: false,
+                forceWordWrap: forceWordWrap.value,
+              },
+              activeConnection: connection,
+              executableSql: sql,
+              explainMode: "explain",
+              blockDangerousRedisCommands: false,
+              sqlKeywordCase: "preserve",
+              databaseRequiredSignal: 0,
+              autoCommit: true,
+              txnSessionId: undefined,
+              txnAutoRolledBack: false,
+              txnPossiblyDirty: false,
+              stickyProvenReadOnlyState: false,
+            }),
+          ]);
+      },
+    });
+    app.use(pinia);
+    app.use(i18n);
+    app.mount(host);
+    await vi.waitFor(() => expect(host.querySelector(".cm-editor")).not.toBeNull(), { timeout: 5000 });
+
+    const view = EditorView.findFromDOM(host.querySelector(".cm-editor") as HTMLElement)!;
+    expect(view.contentDOM.classList.contains("cm-lineWrapping")).toBe(false);
+
+    const wordWrapButton = host.querySelector<HTMLButtonElement>('button[aria-label="settings.wordWrap"]');
+    expect(wordWrapButton).not.toBeNull();
+    expect(wordWrapButton?.getAttribute("aria-pressed")).toBe("false");
+    wordWrapButton?.click();
+
+    await vi.waitFor(() => expect(settingsStore.editorSettings.wordWrap).toBe(true));
+    await nextTick();
+    await vi.waitFor(() => expect(view.contentDOM.classList.contains("cm-lineWrapping")).toBe(true));
+    expect(wordWrapButton?.getAttribute("aria-pressed")).toBe("true");
+
+    wordWrapButton?.click();
+    await vi.waitFor(() => expect(settingsStore.editorSettings.wordWrap).toBe(false));
+    await vi.waitFor(() => expect(view.contentDOM.classList.contains("cm-lineWrapping")).toBe(false));
+    expect(wordWrapButton?.getAttribute("aria-pressed")).toBe("false");
+
+    forceWordWrap.value = true;
+    await nextTick();
+    await vi.waitFor(() => expect(view.contentDOM.classList.contains("cm-lineWrapping")).toBe(true));
+    expect(wordWrapButton?.disabled).toBe(true);
+    expect(wordWrapButton?.getAttribute("aria-pressed")).toBe("true");
+    wordWrapButton?.click();
+    expect(settingsStore.editorSettings.wordWrap).toBe(false);
 
     app.unmount();
     host.remove();
@@ -175,8 +501,8 @@ describe("EditorToolbar mount contract", () => {
       autoCommit: true,
       txnSessionId: undefined,
       txnAutoRolledBack: false,
-      oracleTxnPossiblyDirty: false,
-      isOracleManualTransaction: false,
+      txnPossiblyDirty: false,
+      stickyProvenReadOnlyState: false,
     });
     app.use(pinia);
     app.use(i18n);
@@ -230,8 +556,8 @@ describe("EditorToolbar mount contract", () => {
       autoCommit: true,
       txnSessionId: undefined,
       txnAutoRolledBack: false,
-      oracleTxnPossiblyDirty: false,
-      isOracleManualTransaction: false,
+      txnPossiblyDirty: false,
+      stickyProvenReadOnlyState: false,
     });
     app.config.errorHandler = (err) => {
       errors.push(err);
@@ -244,6 +570,126 @@ describe("EditorToolbar mount contract", () => {
 
     expect(errors).toEqual([]);
     expect(host.querySelector(".app-editor-toolbar")).not.toBeNull();
+
+    app.unmount();
+    host.remove();
+  });
+
+  it("emits foldAll and unfoldAll when clicking the fold/unfold toolbar buttons", async () => {
+    const connectionStore = useConnectionStore();
+    connectionStore.connections = [
+      {
+        id: "conn-1",
+        name: "conn",
+        db_type: "mysql",
+        color: "",
+      } as never,
+    ];
+
+    const host = createHost();
+    const onFoldAll = vi.fn();
+    const onUnfoldAll = vi.fn();
+    const app = createApp(EditorToolbar, {
+      activeTab: {
+        id: "tab-1",
+        title: "SQL",
+        connectionId: "conn-1",
+        database: "db",
+        sql: "SELECT 1;\nSELECT 2;",
+        mode: "query",
+        isExecuting: false,
+        isCancelling: false,
+        isExplaining: false,
+      },
+      activeConnection: connectionStore.getConfig("conn-1"),
+      executableSql: "SELECT 1;\nSELECT 2;",
+      explainMode: "explain",
+      blockDangerousRedisCommands: false,
+      sqlKeywordCase: "preserve",
+      databaseRequiredSignal: 0,
+      autoCommit: true,
+      txnSessionId: undefined,
+      txnAutoRolledBack: false,
+      txnPossiblyDirty: false,
+      stickyProvenReadOnlyState: false,
+      onFoldAll,
+      onUnfoldAll,
+    });
+    app.use(pinia);
+    app.use(i18n);
+    app.mount(host);
+    await nextTick();
+
+    const foldAllButton = host.querySelector<HTMLButtonElement>('button[aria-label="toolbar.foldAll"]');
+    expect(foldAllButton).not.toBeNull();
+    foldAllButton?.dispatchEvent(new MouseEvent("click", { detail: 1, bubbles: true }));
+    await nextTick();
+    expect(onFoldAll).toHaveBeenCalledTimes(1);
+
+    const unfoldAllButton = host.querySelector<HTMLButtonElement>('button[aria-label="toolbar.unfoldAll"]');
+    expect(unfoldAllButton).not.toBeNull();
+    unfoldAllButton?.dispatchEvent(new MouseEvent("click", { detail: 1, bubbles: true }));
+    await nextTick();
+    expect(onUnfoldAll).toHaveBeenCalledTimes(1);
+
+    app.unmount();
+    host.remove();
+  });
+
+  it("renders shortcut hints on button hover tooltips", async () => {
+    const connectionStore = useConnectionStore();
+    connectionStore.connections = [
+      {
+        id: "conn-shortcut",
+        name: "test",
+        db_type: "mysql",
+        color: "",
+      } as never,
+    ];
+    const settingsStore = useSettingsStore();
+    settingsStore.updateEditorSettings({
+      shortcuts: {
+        ...settingsStore.editorSettings.shortcuts,
+        explainSql: "Mod+E",
+        formatSql: "Shift+Mod+F",
+        saveSql: "Mod+S",
+      },
+    });
+
+    const host = createHost();
+    const app = createApp(EditorToolbar, {
+      activeTab: {
+        id: "tab-shortcut",
+        title: "SQL",
+        connectionId: "conn-shortcut",
+        sql: "SELECT 1",
+        mode: "query",
+        isExecuting: false,
+        isCancelling: false,
+        isExplaining: false,
+      },
+      activeConnection: connectionStore.getConfig("conn-shortcut"),
+      executableSql: "SELECT 1",
+      explainMode: "explain",
+      blockDangerousRedisCommands: false,
+      sqlKeywordCase: "preserve",
+      databaseRequiredSignal: 0,
+      autoCommit: true,
+      txnSessionId: undefined,
+      txnAutoRolledBack: false,
+      txnPossiblyDirty: false,
+      stickyProvenReadOnlyState: false,
+    });
+    app.use(pinia);
+    app.use(i18n);
+    app.mount(host);
+    await nextTick();
+    await nextTick();
+
+    const tooltips = [...host.querySelectorAll(".app-editor-toolbar span")].map((el) => el.textContent?.trim() ?? "");
+    expect(tooltips.some((text) => text.includes("toolbar.explainPlan (") && text.includes("E)"))).toBe(true);
+    expect(tooltips.some((text) => text.includes("toolbar.formatSql (") && text.includes("F)"))).toBe(true);
+    expect(tooltips.some((text) => text.includes("toolbar.saveSql (") && text.includes("S)"))).toBe(true);
 
     app.unmount();
     host.remove();

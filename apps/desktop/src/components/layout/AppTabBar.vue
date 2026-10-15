@@ -8,12 +8,15 @@ import { Button } from "@/components/ui/button";
 import { useQueryStore } from "@/stores/queryStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { GROUP_TAB_BAR_PORTAL } from "./groupTabBarPortal";
-import { tabDisplayTitle } from "@/lib/tabs/tabPresentation";
+import { tabDisplayTitle, tabDisplayTitles } from "@/lib/tabs/tabPresentation";
+import type { QueryTab } from "@/types/database";
 import "./appTabBar.css";
 
 const props = defineProps<{
   driverStoreOpen?: boolean;
   driverStoreActive?: boolean;
+  pluginCenterOpen?: boolean;
+  pluginCenterActive?: boolean;
   settingsPageOpen?: boolean;
   settingsPageActive?: boolean;
   agentDriverUpdateCount?: number;
@@ -26,6 +29,8 @@ const props = defineProps<{
 const emit = defineEmits<{
   "activate-driver-store": [];
   "close-driver-store": [];
+  "activate-plugin-center": [];
+  "close-plugin-center": [];
   "activate-settings-page": [];
   "close-settings-page": [];
   "activate-tab": [tabId: string];
@@ -55,7 +60,7 @@ const layoutClass = computed(() => {
 });
 const navigationStyle = computed<CSSProperties>(() => {
   if (!isVerticalLayout.value) return { maxHeight: "50%" };
-  const width = props.tabBarCollapsed ? "3.5rem" : `${props.tabBarWidth ?? 240}px`;
+  const width = props.tabBarCollapsed ? "var(--collapsed-tab-rail-width)" : `${props.tabBarWidth ?? 240}px`;
   return { width, flex: `0 0 ${width}` };
 });
 function setTabBarTarget(groupId: string, element: unknown) {
@@ -65,9 +70,15 @@ function setTabBarTarget(groupId: string, element: unknown) {
 const closeConfirmDirtyCount = computed(() => queryStore.closeConfirmDirtyTabIds.length);
 const showCloseConfirmBulkActions = computed(() => closeConfirmDirtyCount.value > 1);
 const closeConfirmDirtyTabs = computed(() => queryStore.closeConfirmDirtyTabIds.map((id) => queryStore.tabs.find((tab) => tab.id === id)).filter((tab): tab is NonNullable<ReturnType<typeof queryStore.tabs.find>> => !!tab));
+// Numbered across every open tab so unsaved-change confirmations show the
+// same suffixed titles as the tab strip.
+const tabTitles = computed(() => tabDisplayTitles(queryStore.tabs, t));
+function closeConfirmTabTitle(tab: QueryTab): string {
+  return tabTitles.value.get(tab.id) ?? tabDisplayTitle(tab, t);
+}
 const closeConfirmCurrentTitle = computed(() => {
   const focusedTab = closeConfirmDirtyTabs.value.find((tab) => tab.id === queryStore.pendingCloseTabId) ?? closeConfirmDirtyTabs.value[0];
-  return focusedTab ? tabDisplayTitle(focusedTab, t) : "";
+  return focusedTab ? closeConfirmTabTitle(focusedTab) : "";
 });
 const closeConfirmMessage = computed(() => {
   const params = {
@@ -121,14 +132,20 @@ watch(
   },
 );
 
-type SpecialRegularSurface = "driverStore" | "settings";
+type SpecialRegularSurface = "driverStore" | "pluginCenter" | "settings";
 
 function closeSpecialRegularSurfaces(keep?: SpecialRegularSurface) {
   if (keep !== "driverStore" && props.driverStoreOpen) {
     emit("close-driver-store");
   }
+  if (keep !== "pluginCenter" && props.pluginCenterOpen) {
+    emit("close-plugin-center");
+  }
   if (keep !== "settings" && props.settingsPageOpen) {
     emit("close-settings-page");
+  }
+  if (keep !== "pluginCenter" && props.pluginCenterOpen) {
+    emit("close-plugin-center");
   }
 }
 
@@ -141,6 +158,10 @@ function closeOtherActiveTabs() {
   }
   if (props.driverStoreActive) {
     closeSpecialRegularSurfaces("driverStore");
+    return;
+  }
+  if (props.pluginCenterActive) {
+    closeSpecialRegularSurfaces("pluginCenter");
     return;
   }
 
@@ -156,7 +177,12 @@ function closeOtherActiveTabs() {
   queryStore.closeTab(activeTabId);
 }
 
-defineExpose({ closeOtherActiveTabs });
+function closeAllTabs() {
+  closeSpecialRegularSurfaces();
+  queryStore.closeAllTabs();
+}
+
+defineExpose({ closeOtherActiveTabs, closeAllTabs });
 
 function handleSaveAndClose() {
   const id = queryStore.saveAndClosePendingTab();
@@ -188,7 +214,7 @@ function handleCancelClose() {
 <template>
   <!-- Targets remain mounted while inactive so the original group bars can
        move here without losing their local presentation state. -->
-  <div v-show="driverStoreActive || settingsPageActive" data-special-page-workspace class="flex min-h-0 min-w-0 flex-1 overflow-hidden" :class="layoutClass">
+  <div v-show="driverStoreActive || pluginCenterActive || settingsPageActive" data-special-page-workspace class="flex min-h-0 min-w-0 flex-1 overflow-hidden" :class="layoutClass">
     <div data-special-page-navigation class="flex min-h-0 min-w-0 shrink-0 flex-col overflow-auto" :style="navigationStyle">
       <div v-for="group in queryStore.groups" :key="group.id" :ref="(element) => setTabBarTarget(group.id, element)" :data-special-page-tab-target="group.id" class="flex min-h-0 min-w-0" :class="isVerticalLayout ? 'flex-1' : 'shrink-0'" />
     </div>
@@ -235,7 +261,7 @@ function handleCancelClose() {
               <div v-for="tab in closeConfirmDirtyTabs" :key="tab.id" class="flex min-w-0 items-center gap-2 rounded-[6px] px-2 py-1.5 text-sm" :class="tab.id === queryStore.pendingCloseTabId ? 'bg-muted text-foreground' : 'text-muted-foreground'">
                 <span class="h-1.5 w-1.5 shrink-0 rounded-full" :class="tab.id === queryStore.pendingCloseTabId ? 'bg-foreground' : 'bg-muted-foreground/50'" />
                 <span class="min-w-0 truncate">
-                  {{ tabDisplayTitle(tab, t) }}
+                  {{ closeConfirmTabTitle(tab) }}
                 </span>
               </div>
             </div>

@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, watch } from "vue";
-import type { HTMLAttributes } from "vue";
+import type { ComponentPublicInstance, HTMLAttributes } from "vue";
 import { Check, ChevronDown, Search, X } from "@lucide/vue";
+import { useI18n } from "vue-i18n";
 import { Button } from "@/components/ui/button";
 import type { ButtonVariants } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -70,12 +71,86 @@ defineSlots<{
 const open = ref(false);
 const searchText = ref("");
 const searchInput = ref<InstanceType<typeof Input>>();
+const triggerButton = ref<ComponentPublicInstance | HTMLElement>();
 const listContainer = ref<HTMLDivElement>();
 const listCard = ref<HTMLElement>();
 const helpPanel = ref<{ element?: HTMLElement }>();
 const highlightIndex = ref(-1);
 const activeHelpOption = ref<string>();
 const helpPanelOffsetTop = ref(0);
+const { t } = useI18n();
+
+let shouldFocusAdjacentOnClose = false;
+let tabDirection: 1 | -1 = 1;
+
+function getTriggerElement(): HTMLElement | undefined {
+  const target = triggerButton.value;
+  if (!target) return undefined;
+  if (target instanceof HTMLElement) return target;
+  return target.$el instanceof HTMLElement ? target.$el : undefined;
+}
+
+function getFocusableElements(): HTMLElement[] {
+  const selector =
+    'button:not([disabled]):not([tabindex="-1"]), input:not([disabled]):not([tabindex="-1"]), select:not([disabled]):not([tabindex="-1"]), textarea:not([disabled]):not([tabindex="-1"]), a[href]:not([tabindex="-1"]), [contenteditable="true"]:not([tabindex="-1"]), [tabindex]:not([tabindex="-1"]):not([disabled])';
+  return Array.from(document.querySelectorAll<HTMLElement>(selector)).filter((el) => {
+    if (listCard.value?.contains(el)) return false;
+    if (el.hidden || el.getAttribute("aria-hidden") === "true") return false;
+    const style = window.getComputedStyle ? window.getComputedStyle(el) : el.style;
+    return style.display !== "none" && style.visibility !== "hidden";
+  });
+}
+
+function focusAdjacentElement(direction: 1 | -1) {
+  const trigger = getTriggerElement();
+  if (!trigger) return;
+  const elements = getFocusableElements();
+  const index = elements.indexOf(trigger);
+  if (index >= 0) {
+    const target = elements[index + direction];
+    if (target) {
+      target.focus();
+      return;
+    }
+  }
+  trigger.focus();
+}
+
+function handleCloseAutoFocus(event: Event) {
+  if (!shouldFocusAdjacentOnClose) return;
+  event.preventDefault();
+  const dir = tabDirection;
+  shouldFocusAdjacentOnClose = false;
+  focusAdjacentElement(dir);
+}
+
+function isPrintableCharacterKey(event: KeyboardEvent): boolean {
+  return event.key.length === 1 && !event.ctrlKey && !event.altKey && !event.metaKey && event.key !== " " && !event.isComposing && event.key !== "Process" && event.keyCode !== 229;
+}
+
+function handleTriggerKeydown(event: KeyboardEvent) {
+  if (props.disabled) return;
+  if (event.isComposing || event.key === "Process" || event.keyCode === 229) return;
+  if ((event.key === "Backspace" || event.key === "Delete") && props.clearable && props.modelValue) {
+    event.preventDefault();
+    emit("update:modelValue", "");
+    return;
+  }
+  if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+    event.preventDefault();
+    open.value = true;
+    return;
+  }
+  if (isPrintableCharacterKey(event)) {
+    event.preventDefault();
+    if (open.value) {
+      searchText.value += event.key;
+    } else {
+      searchText.value = event.key;
+      open.value = true;
+    }
+  }
+}
 
 const selectedLabel = computed(() => {
   if (!props.modelValue && !props.options.includes("")) return props.placeholder;
@@ -91,6 +166,9 @@ const triggerBaseClass = computed(() =>
 const filteredOptions = computed(() => filterDatabaseOptions(props.options, searchText.value, props.displayName));
 const customOptionValue = computed(() => props.normalizeCustom(props.trimCustom ? searchText.value.trim() : searchText.value));
 const canSelectCustom = computed(() => props.allowCustom && !!customOptionValue.value && !props.options.includes(customOptionValue.value));
+const closedFilteredOptions: string[] = [];
+const openFilteredOptions = computed(() => (open.value ? filteredOptions.value : closedFilteredOptions));
+const openOptionsSignature = computed(() => (open.value ? props.options.join("\0") : ""));
 
 function highlightSelectedOption() {
   const selectedIndex = filteredOptions.value.findIndex((option) => option === props.modelValue);
@@ -122,32 +200,46 @@ watch(open, async (value) => {
     searchText.value = "";
     highlightIndex.value = -1;
     activeHelpOption.value = undefined;
+    if (shouldFocusAdjacentOnClose) {
+      const dir = tabDirection;
+      shouldFocusAdjacentOnClose = false;
+      await nextTick();
+      focusAdjacentElement(dir);
+    }
     return;
+  }
+  if (searchText.value) {
+    highlightIndex.value = optionCount() > 0 ? 0 : -1;
+    activateHelpForHighlightedOption();
+  } else {
+    highlightSelectedOption();
+    activateInitialHelpOption();
   }
   await nextTick();
   const input = searchInput.value?.$el as HTMLInputElement | undefined;
   input?.focus();
+  if (input) {
+    const len = input.value.length;
+    input.setSelectionRange?.(len, len);
+  }
+  void scrollHighlightedOptionIntoView();
+});
+
+watch(searchText, () => {
+  if (!open.value) return;
+  highlightIndex.value = optionCount() > 0 ? 0 : -1;
+  activeHelpOption.value = searchableSelectKeyboardTooltipOption(filteredOptions.value, 0, props.optionTooltip);
+});
+
+watch([() => (open.value ? props.modelValue : undefined), openOptionsSignature], ([_modelValue], [previousModelValue]) => {
+  if (!open.value || previousModelValue === undefined || searchText.value) return;
+  activeHelpOption.value = undefined;
   highlightAndScrollSelectedOption();
   activateInitialHelpOption();
 });
 
-watch(searchText, () => {
-  highlightIndex.value = 0;
-  activeHelpOption.value = searchableSelectKeyboardTooltipOption(filteredOptions.value, 0, props.optionTooltip);
-});
-
-watch(
-  () => [props.modelValue, props.options],
-  () => {
-    if (!open.value || searchText.value) return;
-    activeHelpOption.value = undefined;
-    highlightAndScrollSelectedOption();
-    activateInitialHelpOption();
-  },
-  { deep: true },
-);
-
-watch([highlightIndex, filteredOptions], () => {
+watch([highlightIndex, openFilteredOptions], () => {
+  if (!open.value) return;
   void scrollHighlightedOptionIntoView();
   emit("option-highlight", filteredOptions.value[highlightIndex.value]);
 });
@@ -184,7 +276,8 @@ async function updateHelpPanelOffset() {
   });
 }
 
-watch([activeHelpOption, filteredOptions], () => {
+watch([activeHelpOption, openFilteredOptions], () => {
+  if (!open.value) return;
   void updateHelpPanelOffset();
 });
 
@@ -212,6 +305,7 @@ function optionCount() {
 }
 
 function handleKeydown(event: KeyboardEvent) {
+  if (event.isComposing || event.key === "Process" || event.keyCode === 229) return;
   if (event.key === "ArrowDown") {
     event.preventDefault();
     const total = optionCount();
@@ -232,6 +326,19 @@ function handleKeydown(event: KeyboardEvent) {
     } else {
       selectCustomOption();
     }
+  } else if (event.key === "Tab") {
+    event.preventDefault();
+    if (highlightIndex.value >= 0 && highlightIndex.value < optionCount()) {
+      if (highlightIndex.value < filteredOptions.value.length) {
+        selectOrClearOption(filteredOptions.value[highlightIndex.value]);
+      } else {
+        selectCustomOption();
+      }
+    } else {
+      open.value = false;
+    }
+    shouldFocusAdjacentOnClose = true;
+    tabDirection = event.shiftKey ? -1 : 1;
   } else if (event.key === "Escape") {
     open.value = false;
   }
@@ -241,15 +348,32 @@ function handleKeydown(event: KeyboardEvent) {
 <template>
   <Popover v-model:open="open">
     <PopoverTrigger as-child>
-      <Button type="button" :variant="triggerVariant" :disabled="disabled" :title="selectedLabel" :class="cn(triggerBaseClass, triggerClass)">
+      <!--
+        Keep the trigger Button as the outermost element: triggerClass carries the layout
+        utilities consumers depend on (flex-1 / min-w-0 / max-w-* / w-full / h-*), and any
+        wrapper element would become the flex item and swallow them. The clearable overlay
+        therefore anchors to this button (relative) instead of a wrapper. The overlay is a
+        span (not the svg itself) because the Button base sets [&_svg]:pointer-events-none,
+        which is also why the old in-trigger @pointerdown.stop never fired; @click.stop
+        keeps Reka's bubble-phase trigger onClick (onOpenToggle) from opening the dropdown.
+      -->
+      <Button ref="triggerButton" type="button" :variant="triggerVariant" :disabled="disabled" :title="selectedLabel" :class="cn('relative', triggerBaseClass, triggerClass)" @keydown="handleTriggerKeydown">
         <slot name="trigger-label" :value="modelValue" :label="selectedLabel" :loading="loading">
           <span class="truncate">{{ loading ? loadingText : selectedLabel }}</span>
         </slot>
-        <X v-if="clearable && !disabled && modelValue" :class="cn('shrink-0 opacity-60 hover:opacity-100', triggerIconClass)" @pointerdown.stop.prevent="emit('update:modelValue', '')" />
-        <ChevronDown v-else :class="cn('shrink-0 opacity-60', triggerIconClass)" />
+        <ChevronDown :class="cn('shrink-0 opacity-60', clearable && !disabled && modelValue && 'invisible', triggerIconClass)" />
+        <span
+          v-if="clearable && !disabled && modelValue"
+          class="absolute right-2 top-1/2 z-10 -translate-y-1/2 flex cursor-pointer items-center justify-center opacity-60 hover:opacity-100"
+          :aria-label="t('common.clear')"
+          :title="t('common.clear')"
+          @click.stop.prevent="emit('update:modelValue', '')"
+        >
+          <X :class="triggerIconClass" />
+        </span>
       </Button>
     </PopoverTrigger>
-    <PopoverContent :align="SEARCHABLE_SELECT_HELP_PANEL_ALIGN" :class="cn('w-auto max-w-[calc(100vw-1rem)] border-0 bg-transparent p-0 shadow-none ring-0', contentClass)" :style="contentStyle">
+    <PopoverContent :align="SEARCHABLE_SELECT_HELP_PANEL_ALIGN" :class="cn('w-auto max-w-[calc(100vw-1rem)] border-0 bg-transparent p-0 shadow-none ring-0', contentClass)" :style="contentStyle" @close-auto-focus="handleCloseAutoFocus">
       <div class="flex min-w-0 flex-col gap-2 sm:flex-row sm:items-start">
         <div ref="listCard" :class="cn('shrink-0 rounded-md border bg-popover p-1.5 shadow-md', listClass)">
           <div class="relative rounded-md border bg-background">
@@ -266,6 +390,7 @@ function handleKeydown(event: KeyboardEvent) {
                 v-for="(option, index) in filteredOptions"
                 :key="option"
                 type="button"
+                tabindex="-1"
                 :title="optionTooltip(option) ? undefined : optionTitle(option)"
                 :class="
                   cn(
@@ -291,6 +416,7 @@ function handleKeydown(event: KeyboardEvent) {
               <button
                 v-if="canSelectCustom"
                 type="button"
+                tabindex="-1"
                 :title="customOptionValue"
                 :class="
                   cn(
@@ -313,6 +439,7 @@ function handleKeydown(event: KeyboardEvent) {
             <button
               v-else-if="canSelectCustom"
               type="button"
+              tabindex="-1"
               :title="customOptionValue"
               :class="
                 cn(

@@ -5,13 +5,16 @@ import { useI18n } from "vue-i18n";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { listDatabases, mongoListDatabases, redisListDatabases } from "@/lib/backend/api";
+import { useConnectionStore } from "@/stores/connectionStore";
 import type { McpConnectionPolicy } from "@/stores/settingsStore";
 import type { ConnectionConfig } from "@/types/database";
 
 type DatabaseScope = McpConnectionPolicy["databaseScope"];
 type ExecutionMode = "read_only" | "safe_write" | "high_risk_write";
 const { t } = useI18n();
+const connectionStore = useConnectionStore();
 
 const PAGE_SIZE_OPTIONS = [6, 10, 20] as const;
 const DATABASE_SCOPES: DatabaseScope[] = ["all", "selected", "none"];
@@ -50,7 +53,9 @@ const selectedDatabases = computed(() => selectedPolicy.value?.allowedDatabases 
 const selectedDatabasePolicies = computed(() => selectedPolicy.value?.databasePolicies ?? []);
 const displayedDatabases = computed(() => {
   const query = search.value.trim().toLocaleLowerCase();
-  return (databasesByConnection.value[selectedConnectionId.value] ?? []).filter((database) => !query || database.toLocaleLowerCase().includes(query));
+  // 加载缓存是会话级的：把已持久化的库名并入列表，重开对话框后授权项仍完整可见。
+  const loaded = databasesByConnection.value[selectedConnectionId.value] ?? [];
+  return [...new Set([...selectedDatabases.value, ...loaded])].sort((left, right) => left.localeCompare(right)).filter((database) => !query || database.toLocaleLowerCase().includes(query));
 });
 const connectionPageCount = computed(() => Math.max(1, Math.ceil(scopedConnections.value.length / pageSize.value)));
 const databasePageCount = computed(() => Math.max(1, Math.ceil(displayedDatabases.value.length / pageSize.value)));
@@ -84,6 +89,7 @@ function policyFor(connectionId: string): McpConnectionPolicy {
       databaseScope: "all",
       allowedDatabases: [],
       databasePolicies: [],
+      allowSalesforceDml: false,
     }
   );
 }
@@ -149,6 +155,8 @@ function databasePolicyMode(database: string): ExecutionMode | "inherit" {
 }
 
 function addManualDatabase() {
+  // busy 期间 updateSelectedPolicy 会被丢弃；提前拦截，避免库名进了本地列表却没进策略。
+  if (props.disabled || props.busy) return;
   const database = manualDatabase.value.trim();
   if (!database) return;
   const loaded = databasesByConnection.value[selectedConnectionId.value] ?? [];
@@ -167,6 +175,9 @@ async function loadConnectionDatabases() {
   loadingConnectionId.value = connection.id;
   loadError.value = "";
   try {
+    // SQL 连接的 list_databases 只读后端现有连接池，从未在侧边栏连接过的连接
+    // 会报 "Connection not found"；与侧边栏流程一致，先确保连接建立。
+    await connectionStore.ensureConnected(connection.id, { activate: false });
     const databases = connection.db_type === "mongodb" ? await mongoListDatabases(connection.id) : connection.db_type === "redis" ? (await redisListDatabases(connection.id)).map((database) => String(database.db)) : (await listDatabases(connection.id)).map((database) => database.name);
     databasesByConnection.value = {
       ...databasesByConnection.value,
@@ -211,12 +222,15 @@ watch(databasePageCount, () => setDatabasePage(databasePage.value));
       <div class="border-b p-2 md:border-b-0 md:border-r">
         <div class="flex items-center justify-between gap-2 px-2 pb-2">
           <p class="text-xs font-medium text-muted-foreground">{{ t("settings.mcpDatabaseScopeAllowedConnections") }}</p>
-          <label class="flex h-7 items-center gap-1 rounded border bg-background px-1.5 text-[11px] text-muted-foreground">
-            {{ t("settings.mcpPerPage") }}
-            <select v-model.number="pageSize" class="bg-transparent text-[11px] text-foreground outline-none" :disabled="disabled">
-              <option v-for="size in PAGE_SIZE_OPTIONS" :key="size" :value="size">{{ size }}</option>
-            </select>
-          </label>
+          <div class="flex items-center gap-1 text-[11px] text-muted-foreground">
+            <span>{{ t("settings.mcpPerPage") }}</span>
+            <Select :model-value="String(pageSize)" :disabled="disabled" @update:model-value="(value) => (pageSize = Number(value))">
+              <SelectTrigger size="sm" class="h-7 w-14 px-1.5 text-[11px]"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem v-for="size in PAGE_SIZE_OPTIONS" :key="size" :value="String(size)">{{ size }}</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
         </div>
         <div class="space-y-1">
           <button
@@ -317,8 +331,8 @@ watch(databasePageCount, () => setDatabasePage(databasePage.value));
           <p class="text-xs text-muted-foreground">{{ t("settings.mcpDatabaseScopeSelectedSummary", { count: selectedDatabases.length }) }}</p>
           <div class="flex gap-2">
             <div class="relative min-w-0 flex-1"><Search class="absolute left-2.5 top-2.5 h-3.5 w-3.5 text-muted-foreground" /><Input v-model="search" class="h-8 pl-8 text-xs" :placeholder="t('settings.mcpDatabaseSearchPlaceholder')" /></div>
-            <Input v-model="manualDatabase" class="h-8 w-40 text-xs" :placeholder="t('settings.mcpDatabaseManualPlaceholder')" @keydown.enter.prevent="addManualDatabase" />
-            <Button type="button" variant="outline" size="sm" :disabled="disabled || !manualDatabase.trim()" @click="addManualDatabase"><Plus class="h-3.5 w-3.5" /></Button>
+            <Input v-model="manualDatabase" class="h-8 w-40 text-xs" :placeholder="t('settings.mcpDatabaseManualPlaceholder')" :disabled="disabled || busy" @keydown.enter.prevent="addManualDatabase" />
+            <Button type="button" variant="outline" size="sm" :disabled="disabled || busy || !manualDatabase.trim()" @click="addManualDatabase"><Plus class="h-3.5 w-3.5" /></Button>
           </div>
           <p v-if="loadError" class="rounded border border-destructive/30 bg-destructive/5 px-2 py-1.5 text-xs text-destructive">{{ t("settings.mcpDatabaseLoadFailed", { error: loadError }) }}</p>
           <div v-if="displayedDatabases.length" class="rounded border">
@@ -326,19 +340,15 @@ watch(databasePageCount, () => setDatabasePage(databasePage.value));
               <input type="checkbox" :checked="selectedDatabases.includes(database)" :disabled="disabled || busy" @change="toggleDatabase(database, ($event.target as HTMLInputElement).checked)" />
               <span class="min-w-0 flex-1 truncate font-mono">{{ database }}</span>
               <Check v-if="selectedDatabases.includes(database)" class="h-3.5 w-3.5 text-green-600" />
-              <select
-                v-if="selectedDatabases.includes(database)"
-                :value="databasePolicyMode(database)"
-                class="h-7 shrink-0 rounded border bg-background px-1.5 text-[11px]"
-                :disabled="disabled || busy"
-                @click.stop
-                @change="$emit('set:database-policy', selectedConnectionId, database, ($event.target as HTMLSelectElement).value as ExecutionMode | 'inherit')"
-              >
-                <option value="inherit">{{ t("settings.mcpConnectionPolicyInherit") }}</option>
-                <option value="read_only">{{ t("settings.mcpConnectionPolicyReadOnly") }}</option>
-                <option value="safe_write">{{ t("settings.mcpConnectionPolicySafeWrite") }}</option>
-                <option value="high_risk_write">{{ t("settings.mcpConnectionPolicyHighRiskWrite") }}</option>
-              </select>
+              <Select v-if="selectedDatabases.includes(database)" :model-value="databasePolicyMode(database)" :disabled="disabled || busy" @update:model-value="(value) => $emit('set:database-policy', selectedConnectionId, database, value as ExecutionMode | 'inherit')">
+                <SelectTrigger size="sm" class="h-7 w-44 shrink-0 text-[11px]" @click.stop><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="inherit">{{ t("settings.mcpConnectionPolicyInherit") }}</SelectItem>
+                  <SelectItem value="read_only">{{ t("settings.mcpConnectionPolicyReadOnly") }}</SelectItem>
+                  <SelectItem value="safe_write">{{ t("settings.mcpConnectionPolicySafeWrite") }}</SelectItem>
+                  <SelectItem value="high_risk_write">{{ t("settings.mcpConnectionPolicyHighRiskWrite") }}</SelectItem>
+                </SelectContent>
+              </Select>
             </label>
             <div v-if="databasePageCount > 1" class="flex items-center justify-center gap-2 border-t px-3 py-2 text-xs text-muted-foreground">
               <Button type="button" size="icon-sm" variant="ghost" :disabled="databasePage === 1" :title="t('settings.mcpPreviousPage')" :aria-label="t('settings.mcpPreviousPage')" @click="setDatabasePage(databasePage - 1)"><ChevronLeft /></Button>

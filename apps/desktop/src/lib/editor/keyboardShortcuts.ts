@@ -17,8 +17,51 @@ function normalizeKey(key: string): string {
   return key.length === 1 ? key.toLowerCase() : key;
 }
 
+// Physical keys whose unshifted character CodeMirror always registers bindings
+// under. `KeyboardEvent.key` reports the *shifted* character instead ("/" -> "?",
+// "1" -> "!"), so a shortcut recorded from that character can never match the
+// binding CodeMirror looks up. Letters are excluded: they already round-trip
+// because `shortcutToCodeMirrorKey` lowercases them.
+const BASE_KEY_BY_CODE: Record<string, string> = {
+  Digit0: "0",
+  Digit1: "1",
+  Digit2: "2",
+  Digit3: "3",
+  Digit4: "4",
+  Digit5: "5",
+  Digit6: "6",
+  Digit7: "7",
+  Digit8: "8",
+  Digit9: "9",
+  Backquote: "`",
+  Minus: "-",
+  Equal: "=",
+  BracketLeft: "[",
+  BracketRight: "]",
+  Backslash: "\\",
+  Semicolon: ";",
+  Quote: "'",
+  Comma: ",",
+  Period: ".",
+  Slash: "/",
+};
+
+/**
+ * The unshifted character for a shifted punctuation/digit press, or null when
+ * the event is not one. Mirrors CodeMirror's `base[event.keyCode]` table, which
+ * is what its keymap resolves `Shift-` bindings against.
+ */
+function baseKeyForShiftedEvent(event: ShortcutLikeEvent): string | null {
+  if (!event.shiftKey || event.key.length !== 1) return null;
+  const baseKey = BASE_KEY_BY_CODE[event.code ?? ""];
+  return baseKey && baseKey !== event.key ? baseKey : null;
+}
+
 function matchesShortcutKey(event: ShortcutLikeEvent, key: string, platform = globalThis.navigator?.platform || ""): boolean {
   if (normalizeKey(event.key) === normalizeKey(key)) return true;
+  // Shortcuts store the unshifted character for shifted punctuation/digits (see
+  // baseKeyForShiftedEvent), so match those against the physical key too.
+  if (baseKeyForShiftedEvent(event) === normalizeKey(key)) return true;
   // KeyboardEvent.code 回退：event.key 随布局/修饰键变形时按物理键位匹配
   // （macOS Option+字母 → 变形字符如 ⌥W="∑"；俄文等非拉丁布局 → "Ц"）。
   // 仅限 Alt 组合键场景
@@ -41,6 +84,10 @@ function shortcutKeyNameFromEvent(event: ShortcutLikeEvent, platform: string): s
   if (event.altKey && isMacShortcutPlatform(platform) && /^Key[A-Z]$/.test(event.code ?? "")) {
     return event.code!.slice(3);
   }
+  // Record "Shift+Mod+/" rather than "Shift+Mod+?" so the CodeMirror binding
+  // ("Shift-Ctrl-/") is one the keymap actually resolves for this key press.
+  const baseKey = baseKeyForShiftedEvent(event);
+  if (baseKey) return shortcutKeyName(baseKey);
   return shortcutKeyName(event.key);
 }
 
@@ -137,8 +184,20 @@ export function isCloseTabShortcut(event: ShortcutLikeEvent, shortcuts?: Partial
   return matchesShortcut(event, actionShortcut("closeTab", shortcuts));
 }
 
+export function isReopenClosedTabShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>): boolean {
+  return matchesShortcut(event, actionShortcut("reopenClosedTab", shortcuts));
+}
+
 export function isCloseOtherTabsShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>, platform = globalThis.navigator?.platform || ""): boolean {
   return matchesShortcut(event, actionShortcut("closeOtherTabs", shortcuts), platform);
+}
+
+export function isCloseAllTabsShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>, platform = globalThis.navigator?.platform || ""): boolean {
+  return matchesShortcut(event, actionShortcut("closeAllTabs", shortcuts), platform);
+}
+
+export function isCloseWindowShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>): boolean {
+  return matchesShortcut(event, actionShortcut("closeWindow", shortcuts));
 }
 
 export function isSendSelectionToAiShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>): boolean {
@@ -155,6 +214,19 @@ export function isConvertNamingStyleShortcut(event: ShortcutLikeEvent, shortcuts
 
 export function isNewQueryShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>): boolean {
   return matchesShortcut(event, actionShortcut("newQuery", shortcuts));
+}
+
+/** Whether a global shortcut originated from the sidebar navigation surface. */
+export function isSidebarFocusedTarget(target: EventTarget | null, lastFocusedSidebarSurface = false): boolean {
+  if (typeof Element !== "undefined" && target instanceof Element && target.closest("[data-app-sidebar]")) return true;
+  if (!lastFocusedSidebarSurface || typeof document === "undefined") return false;
+  return !target || target === document.body || target === document.documentElement;
+}
+
+/** Whether the default-query shortcut is being invoked from navigation/search UI. */
+export function isDefaultQueryShortcutTarget(target: EventTarget | null, lastFocusedSidebarSurface = false): boolean {
+  if (isSidebarFocusedTarget(target, lastFocusedSidebarSurface)) return true;
+  return typeof Element !== "undefined" && target instanceof Element && !!target.closest("[data-object-search-input]");
 }
 
 export function isOpenSettingsShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>): boolean {
@@ -218,12 +290,20 @@ export function isCopyCurrentRowShortcut(event: ShortcutLikeEvent, shortcuts?: P
   return matchesShortcut(event, actionShortcut("copyCurrentRow", shortcuts));
 }
 
+export function isEditCellShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>, platform = globalThis.navigator?.platform || ""): boolean {
+  return matchesShortcut(event, actionShortcut("editCell", shortcuts, platform), platform);
+}
+
 export function isEditTableStructureShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>, platform = globalThis.navigator?.platform || ""): boolean {
   return matchesShortcut(event, actionShortcut("editTableStructure", shortcuts, platform), platform);
 }
 
 export function isDeleteCurrentRowShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>): boolean {
   return matchesShortcut(event, actionShortcut("deleteCurrentRow", shortcuts));
+}
+
+export function isFocusWhereShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>, platform = globalThis.navigator?.platform || ""): boolean {
+  return matchesShortcut(event, actionShortcut("focusWhere", shortcuts, platform), platform);
 }
 
 export function isGoToColumnShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>, platform = globalThis.navigator?.platform || ""): boolean {
@@ -258,6 +338,10 @@ export function isToggleZenModeShortcut(event: ShortcutLikeEvent, shortcuts?: Pa
   return matchesShortcut(event, actionShortcut("toggleZenMode", shortcuts));
 }
 
+export function isDisconnectAllActiveConnectionsShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>): boolean {
+  return matchesShortcut(event, actionShortcut("disconnectAllActiveConnections", shortcuts));
+}
+
 export function isCopySidebarSelectionShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>): boolean {
   return matchesShortcut(event, actionShortcut("copySidebarSelection", shortcuts));
 }
@@ -270,12 +354,24 @@ export function isEditSidebarConnectionShortcut(event: ShortcutLikeEvent, shortc
   return matchesShortcut(event, actionShortcut("editSidebarConnection", shortcuts));
 }
 
+export function isDisconnectSidebarConnectionShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>): boolean {
+  return matchesShortcut(event, actionShortcut("disconnectSidebarConnection", shortcuts));
+}
+
 export function isViewTableDdlShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>): boolean {
   return matchesShortcut(event, actionShortcut("viewTableDdl", shortcuts));
 }
 
+export function isEditSidebarTableStructureShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>, platform = globalThis.navigator?.platform || ""): boolean {
+  return matchesShortcut(event, actionShortcut("editSidebarTableStructure", shortcuts, platform), platform);
+}
+
 export function isQuickOpenShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>): boolean {
   return matchesShortcut(event, actionShortcut("quickOpen", shortcuts));
+}
+
+export function isGlobalSearchShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>): boolean {
+  return matchesShortcut(event, actionShortcut("globalSearch", shortcuts));
 }
 
 export function isNavigateTabHistoryBackShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>, platform = globalThis.navigator?.platform || ""): boolean {
@@ -323,4 +419,33 @@ export function isBrowserReloadShortcut(event: ShortcutLikeEvent): boolean {
   const key = normalizeKey(event.key);
   if (key === "F5") return true;
   return key === "r" && (!!event.metaKey || !!event.ctrlKey);
+}
+
+export function isBrowserTaskManagerShortcut(event: ShortcutLikeEvent): boolean {
+  if (event.isComposing || event.altKey || event.ctrlKey || event.metaKey) return false;
+  if (!event.shiftKey) return false;
+  return event.key === "Escape" || event.key === "Esc" || event.code === "Escape";
+}
+
+export function isCaretBrowsingShortcut(event: ShortcutLikeEvent): boolean {
+  if (event.isComposing || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return false;
+  return event.key === "F7" || event.code === "F7";
+}
+
+export function isConfiguredShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>, platform = globalThis.navigator?.platform || ""): boolean {
+  if (!shortcuts) return false;
+  const normalized = normalizeShortcutSettings(shortcuts, platform);
+  return Object.values(normalized).some((shortcut) => matchesShortcut(event, shortcut, platform));
+}
+
+export interface CaretBrowsingBlockOptions {
+  caretBrowsingEnabled?: boolean;
+  shortcuts?: Partial<ShortcutSettings>;
+}
+
+export function shouldBlockCaretBrowsing(event: ShortcutLikeEvent, options?: CaretBrowsingBlockOptions, platform = globalThis.navigator?.platform || ""): boolean {
+  if (options?.caretBrowsingEnabled) return false;
+  if (!isCaretBrowsingShortcut(event)) return false;
+  if (options?.shortcuts && isConfiguredShortcut(event, options.shortcuts, platform)) return false;
+  return true;
 }
