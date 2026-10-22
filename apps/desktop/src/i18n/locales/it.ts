@@ -3223,6 +3223,7 @@ export default withEnglishFallback({
     copyCurrentPageSql: "Copia SQL della pagina corrente",
     copyActualExecutionSql: "Copia SQL effettivamente eseguito",
     pageProbeDescription: "Questa pagina mostra al massimo {count} righe; viene letta al massimo 1 riga aggiuntiva per determinare se esiste una pagina successiva.",
+    copyExtractorQuoteIdentifiersHint: "Al momento non ha effetto: l'impostazione dell'editor «Aggiungi virgolette agli identificatori durante la generazione di SQL» è disattivata; il SQL copiato non include mai le virgolette che è possibile omettere.",
   },
   exportProgress: {
     streamingUnsupported: "L'esportazione in streaming non è supportata per questa query. Semplificala o usa un driver supportato.",

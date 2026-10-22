@@ -3177,6 +3177,7 @@ export default withEnglishFallback({
     copyCurrentPageSql: "현재 페이지 SQL 복사",
     copyActualExecutionSql: "실제 실행 SQL 복사",
     pageProbeDescription: "이 페이지에는 최대 {count}행이 표시되며, 다음 페이지가 있는지 판단하기 위해 최대 1행을 추가로 읽습니다.",
+    copyExtractorQuoteIdentifiersHint: "현재 적용되지 않음: 편집기 설정 「SQL 생성 시 식별자에 따옴표 추가」가 꺼져 있어, 복사된 SQL에는 생략 가능한 따옴표가 일괄적으로 포함되지 않습니다.",
   },
   exportProgress: {
     streamingUnsupported: "이 쿼리는 스트리밍 내보내기를 지원하지 않습니다. 쿼리를 단순화하거나 지원되는 드라이버를 사용하세요.",
